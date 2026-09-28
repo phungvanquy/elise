@@ -18,6 +18,7 @@ helper = sys.argv[1]
 
 class Panel(BaseHTTPRequestHandler):
     def do_GET(self):
+        assert self.headers.get('User-Agent') == 'V2bX-Elise/1.0'
         query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         assert query == {'node_type': ['vmess'], 'node_id': ['9'], 'token': ['key+value']}, query
         payload = json.dumps({'server_port': node_port, 'tls': 0, 'network': 'tcp'}).encode()

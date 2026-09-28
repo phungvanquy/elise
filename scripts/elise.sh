@@ -237,7 +237,8 @@ kind = values['panel_node_type']
 query = urllib.parse.urlencode({'node_type': kind, 'node_id': values['node_id'], 'token': values['panel_key']})
 url = values['panel_url'].rstrip('/') + '/api/v1/server/UniProxy/config?' + query
 try:
-    with urllib.request.urlopen(url, timeout=15) as response:
+    request = urllib.request.Request(url, headers={'User-Agent': 'V2bX-Elise/1.0'})
+    with urllib.request.urlopen(request, timeout=15) as response:
         payload = json.load(response)
 except Exception as exc:
     sys.exit(f'cannot fetch panel node configuration: {exc}')
