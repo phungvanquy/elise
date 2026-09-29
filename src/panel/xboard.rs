@@ -397,19 +397,13 @@ impl XboardClient {
         node_id: u32,
     ) -> Result<HashMap<u32, u32>, Box<dyn std::error::Error + Send + Sync>> {
         let url = self.endpoint("/api/v1/server/UniProxy/alivelist", node_id)?;
-        let resp = match self.client.get(&url).send().await {
-            Ok(r) => r,
-            Err(_) => return Ok(HashMap::new()),
-        };
+        let resp = self.client.get(&url).send().await?;
 
         if !resp.status().is_success() {
-            return Ok(HashMap::new());
+            return Err(format!("Xboard API alive list returned status {}", resp.status()).into());
         }
 
-        let val: Value = match resp.json().await {
-            Ok(v) => v,
-            Err(_) => return Ok(HashMap::new()),
-        };
+        let val: Value = resp.json().await?;
 
         let mut res = HashMap::new();
         let map_obj = val

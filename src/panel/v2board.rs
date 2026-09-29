@@ -431,19 +431,13 @@ impl V2BoardClient {
             "{}/api/v1/server/UniProxy/alivelist?node_type=v2node&node_id={}&token={}",
             self.base_url, node_id, self.token
         );
-        let resp = match self.client.get(&url).send().await {
-            Ok(r) => r,
-            Err(_) => return Ok(HashMap::new()),
-        };
+        let resp = self.client.get(&url).send().await?;
 
         if !resp.status().is_success() {
-            return Ok(HashMap::new());
+            return Err(format!("V2Board API alive list returned status {}", resp.status()).into());
         }
 
-        let val: Value = match resp.json().await {
-            Ok(v) => v,
-            Err(_) => return Ok(HashMap::new()),
-        };
+        let val: Value = resp.json().await?;
 
         let mut res = HashMap::new();
         let map_obj = val

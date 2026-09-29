@@ -492,19 +492,13 @@ impl PPanelClient {
             "{}/v1/server/alivelist?server_id={}&secret_key={}",
             self.base_url, node_id, self.key
         );
-        let resp = match self.client.get(&url).send().await {
-            Ok(r) => r,
-            Err(_) => return Ok(HashMap::new()),
-        };
+        let resp = self.client.get(&url).send().await?;
 
         if !resp.status().is_success() {
-            return Ok(HashMap::new());
+            return Err(format!("PPanel API alive list returned status {}", resp.status()).into());
         }
 
-        let val: Value = match resp.json().await {
-            Ok(v) => v,
-            Err(_) => return Ok(HashMap::new()),
-        };
+        let val: Value = resp.json().await?;
 
         let mut res = HashMap::new();
         let map_obj = val

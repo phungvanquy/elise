@@ -467,20 +467,28 @@ impl NodeRunner {
             })
         };
 
-        let _ = shutdown_rx.recv().await;
+        let mut inbound_task = inbound_task;
+        let inbound_finished = tokio::select! {
+            biased;
+            _ = shutdown_rx.recv() => false,
+            result = &mut inbound_task => {
+                error!(node_id = self.node_id, ?result, "Inbound stopped unexpectedly");
+                true
+            }
+        };
         info!("NodeRunner {} shutting down", self.node_id);
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         for mut task in [report_task, rules_sync_task, local_watch_task] {
-            if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
+            if inbound_finished || tokio::time::timeout_at(deadline, &mut task).await.is_err() {
                 task.abort();
                 let _ = task.await;
             }
         }
-        let mut inbound_task = inbound_task;
-        if tokio::time::timeout(Duration::from_secs(35), &mut inbound_task)
-            .await
-            .is_err()
+        if !inbound_finished
+            && tokio::time::timeout(Duration::from_secs(35), &mut inbound_task)
+                .await
+                .is_err()
         {
             warn!("Node {}: Inbound drain timed out", self.node_id);
             inbound_task.abort();
@@ -762,10 +770,14 @@ impl NodeRunner {
             }
         }
 
-        if let Ok(alive_map) = self.panel_client.get_user_alivelist(self.node_id).await {
-            if !alive_map.is_empty() {
+        match self.panel_client.get_user_alivelist(self.node_id).await {
+            Ok(alive_map) => {
                 self.device_limiter.update_global_alive(alive_map);
             }
+            Err(e)
+                if e.downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::Unsupported) => {}
+            Err(e) => warn!(node_id = self.node_id, error = %e, "Alive list sync failed"),
         }
         synced
     }
@@ -912,6 +924,69 @@ mod tests {
             )),
             Arc::new(IpUserCache::new(1, false, "")),
         )
+    }
+
+    #[tokio::test]
+    async fn empty_alive_list_clears_counts_but_panel_errors_preserve_them() {
+        let panel = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let panel_addr = panel.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for (path, status, body) in [
+                (
+                    "user",
+                    "200 OK",
+                    r#"{"users":[{"id":7,"uuid":"fb11878d-1492-4a7b-b98d-cf916067833e","device_limit":1}]}"#,
+                ),
+                ("alivelist", "200 OK", r#"{"alive":{"7":1}}"#),
+                (
+                    "user",
+                    "200 OK",
+                    r#"{"users":[{"id":7,"uuid":"fb11878d-1492-4a7b-b98d-cf916067833e","device_limit":1}]}"#,
+                ),
+                ("alivelist", "500 Internal Server Error", "{}"),
+                (
+                    "user",
+                    "200 OK",
+                    r#"{"users":[{"id":7,"uuid":"fb11878d-1492-4a7b-b98d-cf916067833e","device_limit":1}]}"#,
+                ),
+                ("alivelist", "200 OK", r#"{"alive":{}}"#),
+            ] {
+                let (mut stream, _) = panel.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(stream.read_u8().await.unwrap());
+                }
+                let request = String::from_utf8(request).unwrap();
+                assert!(request.split_whitespace().nth(1).unwrap().contains(path));
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let mut runner = runner(format!("http://{panel_addr}"));
+        runner.panel_client = Arc::new(crate::panel::XboardClient::new_with_node_type(
+            format!("http://{panel_addr}"),
+            "fixture".into(),
+            Some("vless".into()),
+        ));
+        let inbound: Arc<dyn Inbound> = Arc::new(crate::protocol::vless::VlessInbound::new());
+        let client_ip = "198.51.100.7".parse().unwrap();
+
+        runner.sync_users(&inbound).await;
+        assert!(!runner.device_limiter.check_and_record(7, client_ip));
+        runner.sync_users(&inbound).await;
+        assert!(!runner.device_limiter.check_and_record(7, client_ip));
+        runner.sync_users(&inbound).await;
+        assert!(runner.device_limiter.check_and_record(7, client_ip));
+        server.await.unwrap();
     }
 
     #[tokio::test]

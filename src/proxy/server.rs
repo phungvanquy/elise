@@ -10,6 +10,7 @@ use crate::security::{AttackDefenseManager, AuditController, TLSManager};
 use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::sync::broadcast;
+use tokio::task::JoinSet;
 use tracing::info;
 
 pub struct MasterServer {
@@ -31,6 +32,9 @@ impl MasterServer {
             "Elise MasterServer initializing with {} configured node(s)",
             self.global_config.node_ids.len()
         );
+        if self.global_config.node_ids.is_empty() {
+            return Err("No nodes are configured".into());
+        }
 
         let panel_client = crate::panel::create_panel_client_with_node_type(
             &self.global_config.panel_type,
@@ -124,7 +128,7 @@ impl MasterServer {
             .nodes_dir
             .clone()
             .unwrap_or_else(find_nodes_dir);
-        let mut node_handles = Vec::new();
+        let mut node_handles = JoinSet::new();
 
         for (idx, &node_id) in self.global_config.node_ids.iter().enumerate() {
             let mut node_cfg = NodeConfig::load_for_node(&nodes_dir, node_id);
@@ -150,9 +154,10 @@ impl MasterServer {
             ));
 
             let shutdown_sub = self.shutdown_tx.subscribe();
-            node_handles.push(tokio::spawn(async move {
+            node_handles.spawn(async move {
                 runner.run(shutdown_sub).await;
-            }));
+                node_id
+            });
         }
 
         info!(
@@ -169,20 +174,28 @@ impl MasterServer {
         #[cfg(unix)]
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => info!("SIGINT received, shutting down Elise MasterServer..."),
-            _ = shutdown.recv() => {},
+        let failure = tokio::select! {
+            biased;
+            _ = shutdown.recv() => None,
+            _ = tokio::signal::ctrl_c() => { info!("SIGINT received, shutting down Elise MasterServer..."); None },
             _ = async {
                 #[cfg(unix)]
                 terminate.recv().await;
                 #[cfg(not(unix))]
                 std::future::pending::<()>().await;
-            } => info!("SIGTERM received, shutting down Elise MasterServer..."),
-        }
+            } => { info!("SIGTERM received, shutting down Elise MasterServer..."); None },
+            result = node_handles.join_next() => Some(match result {
+                Some(Ok(node_id)) => format!("Node {node_id} stopped unexpectedly"),
+                Some(Err(e)) => format!("Node task failed: {e}"),
+                None => "All node runners stopped unexpectedly".to_string(),
+            }),
+        };
 
         let _ = self.shutdown_tx.send(());
-        for handle in node_handles {
-            let _ = handle.await;
+        while let Some(result) = node_handles.join_next().await {
+            if let Err(e) = result {
+                tracing::error!(error = %e, "Node task failed during shutdown");
+            }
         }
 
         if let Some(h) = pprof_handle {
@@ -191,6 +204,9 @@ impl MasterServer {
 
         ip_user_cache.save_to_disk();
 
+        if let Some(message) = failure {
+            return Err(message.into());
+        }
         info!("Elise MasterServer terminated cleanly.");
         Ok(())
     }
@@ -210,4 +226,81 @@ fn find_nodes_dir() -> std::path::PathBuf {
         return local;
     }
     standard
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn master_exits_when_its_node_cannot_start() {
+        for case in ["panel_error", "bind_error"] {
+            let occupied = if case == "bind_error" {
+                Some(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
+            } else {
+                None
+            };
+            let panel = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let panel_addr = panel.local_addr().unwrap();
+            let port = occupied
+                .as_ref()
+                .map(|listener| listener.local_addr().unwrap().port())
+                .unwrap_or(12345);
+            let panel_task = tokio::spawn(async move {
+                let (mut stream, _) = panel.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(stream.read_u8().await.unwrap());
+                }
+                let (status, body) = if case == "panel_error" {
+                    ("403 Forbidden", "{}".to_string())
+                } else {
+                    (
+                        "200 OK",
+                        format!(
+                            r#"{{"server_type":"vless","server_port":{port},"network":"tcp","tls":0}}"#
+                        ),
+                    )
+                };
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            });
+
+            let dir =
+                std::env::temp_dir().join(format!("elise-master-test-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let config = GlobalConfig {
+                api_host: format!("http://{panel_addr}"),
+                api_key: "fixture".into(),
+                panel_node_type: Some("vless".into()),
+                node_ids: vec![7],
+                listen_addr: "127.0.0.1".into(),
+                nodes_dir: Some(dir.join("nodes")),
+                ip_user_cache_save_dir: dir.clone(),
+                pprof_addr: "off".into(),
+                auto_tls: false,
+                ..GlobalConfig::default()
+            };
+
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                MasterServer::new(config).run(),
+            )
+            .await
+            .expect("master must exit when its only node fails");
+            assert!(result.is_err(), "{case}: master exited successfully");
+            panel_task.await.unwrap();
+            drop(occupied);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
 }

@@ -39,7 +39,11 @@ pub trait PanelClient: Send + Sync {
         &self,
         _node_id: u32,
     ) -> Result<std::collections::HashMap<u32, u32>, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(std::collections::HashMap::new())
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Panel does not provide an alive list",
+        )
+        .into())
     }
     async fn report_node_status(
         &self,
