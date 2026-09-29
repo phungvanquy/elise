@@ -75,4 +75,31 @@ with TemporaryDirectory() as root:
         subprocess.run(['sha256sum', '-c', archive + '.sha256'], cwd=output, check=True, capture_output=True)
         with tarfile.open(output / archive, 'r:gz') as packaged:
             assert {'elise/elise', 'elise/LICENSE', 'elise/README.md'} <= set(packaged.getnames())
+
+with TemporaryDirectory() as root:
+    fake_bin = Path(root) / 'bin'
+    fake_bin.mkdir()
+    (fake_bin / 'cat').symlink_to('/bin/cat')
+    package_log = Path(root) / 'packages.log'
+    apt_get = fake_bin / 'apt-get'
+    apt_get.write_text(
+        '#!/bin/sh\n'
+        'printf "%s\\n" "$*" >> "$ELISE_PACKAGE_LOG"\n'
+        'if [ "$1" = install ]; then\n'
+        '  printf "#!/bin/sh\\nexit 0\\n" > "$ELISE_FAKE_BIN/python3"\n'
+        '  /bin/chmod 755 "$ELISE_FAKE_BIN/python3"\n'
+        'fi\n'
+    )
+    apt_get.chmod(0o755)
+    env = os.environ.copy()
+    env.update({
+        'PATH': str(fake_bin),
+        'ELISE_PACKAGE_LOG': str(package_log),
+        'ELISE_FAKE_BIN': str(fake_bin),
+    })
+    command = 'helper=$1; set --; source "$helper" >/dev/null; ensure_python'
+    for _ in range(2):
+        subprocess.run(['/bin/bash', '-c', command, 'bash', helper], env=env, check=True, capture_output=True)
+    assert package_log.read_text().splitlines() == ['update -y', 'install -y python3']
+    assert (fake_bin / 'python3').is_file()
 PY

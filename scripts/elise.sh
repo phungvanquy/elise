@@ -15,7 +15,20 @@ trap '[[ -z "$work" ]] || rm -rf -- "$work"' EXIT
 die() { echo "V2bX Elise: $*" >&2; exit 1; }
 need_root() { [[ $EUID -eq 0 ]] || die "run as root"; }
 need_systemd() { command -v systemctl >/dev/null && [[ -d /run/systemd/system ]] || die "systemd is required"; }
-need_python() { command -v python3 >/dev/null || die "python3 is required"; }
+ensure_python() {
+    command -v python3 >/dev/null 2>&1 && return 0
+    echo "V2bX Elise: installing python3" >&2
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y python3 || die "could not install python3 with apt-get"
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y python3 || die "could not install python3 with dnf"
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y python3 || die "could not install python3 with yum"
+    else
+        die "python3 is required and no supported package manager was found"
+    fi
+    command -v python3 >/dev/null 2>&1 || die "python3 installation did not provide python3"
+}
 fetch() {
     curl --fail --location --silent --show-error --proto '=https' --proto-redir '=https' \
         --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 300 \
@@ -70,13 +83,14 @@ installed_instances() {
 }
 
 install_binary() {
-    need_root; need_systemd; need_python
+    need_root; need_systemd
     local arch tag asset archive checksum expected actual old_binary old_unit old_license port listen details binary_version
     case "$(uname -m)" in
         x86_64|amd64) arch=amd64 ;;
         aarch64|arm64) arch=arm64 ;;
         *) die "Elise releases support Linux amd64 and arm64; this host is $(uname -m)" ;;
     esac
+    ensure_python
     work=$(mktemp -d /tmp/v2bx-elise.XXXXXX)
     if [[ -n "${1:-}" ]]; then
         tag=${1#v}
@@ -289,8 +303,9 @@ PY
 }
 
 add_node() {
-    need_root; need_systemd; need_python
+    need_root; need_systemd
     [[ -x "$binary" ]] || die "install the Elise binary first"
+    ensure_python
     local kind=${1:-} node_id=${2:-} instance target panel_url panel_key listen cert_file key_file security port
     [[ "$kind" == vless || "$kind" == vmess ]] || die "type must be vless or vmess"
     [[ "$node_id" =~ ^[1-9][0-9]*$ ]] || die "node ID must be a positive integer"
