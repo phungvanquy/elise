@@ -12,6 +12,7 @@ import os
 import socket
 import subprocess
 import sys
+import tarfile
 import urllib.parse
 
 helper = sys.argv[1]
@@ -61,4 +62,17 @@ try:
         assert result.stdout.strip() == f'{node_port}\n0', result.stdout
 finally:
     server.shutdown()
+
+with TemporaryDirectory() as root:
+    binary = Path(root) / 'elise'
+    binary.write_text('#!/bin/sh\necho elise 1.0.1\n')
+    binary.chmod(0o755)
+    output = Path(root) / 'dist'
+    package_script = Path(helper).parent / 'package-elise.sh'
+    for arch in ('amd64', 'arm64'):
+        subprocess.run(['bash', str(package_script), str(binary), arch, str(output)], check=True)
+        archive = f'elise-linux-{arch}.tar.gz'
+        subprocess.run(['sha256sum', '-c', archive + '.sha256'], cwd=output, check=True, capture_output=True)
+        with tarfile.open(output / archive, 'r:gz') as packaged:
+            assert {'elise/elise', 'elise/LICENSE', 'elise/README.md'} <= set(packaged.getnames())
 PY

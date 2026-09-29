@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Elise remains a separate Rust process. The V2bX Go service must not manage
 # the same panel node, or both processes will bind and report it.
-repo="phungvanquy/Elise-Backend"
+repo="phungvanquy/v2bx-new"
 bin_dir="/usr/local/libexec/V2bX"
 binary="${bin_dir}/elise"
 config_dir="/etc/v2bx-elise"
@@ -71,7 +71,7 @@ installed_instances() {
 
 install_binary() {
     need_root; need_systemd; need_python
-    local arch tag asset archive checksum expected actual old_binary old_unit old_license port listen details
+    local arch tag asset archive checksum expected actual old_binary old_unit old_license port listen details binary_version
     case "$(uname -m)" in
         x86_64|amd64) arch=amd64 ;;
         aarch64|arm64) arch=arm64 ;;
@@ -80,7 +80,7 @@ install_binary() {
     work=$(mktemp -d /tmp/v2bx-elise.XXXXXX)
     if [[ -n "${1:-}" ]]; then
         tag=${1#v}
-        [[ "$tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]] || die "invalid Elise version"
+        [[ "$tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]] || die "invalid V2bX release version"
         tag="v$tag"
         fetch "https://api.github.com/repos/$repo/releases/tags/$tag" "$work/release.json"
     else
@@ -90,7 +90,7 @@ import json, re, sys
 release = json.load(open(sys.argv[1]))
 tag = release.get('tag_name', '')
 if release.get('draft') or release.get('prerelease') or not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', tag):
-    sys.exit('invalid latest Elise release')
+    sys.exit('invalid latest V2bX release')
 print(tag)
 PY
         )
@@ -103,7 +103,7 @@ repo, tag, asset = sys.argv[2:]
 expected = {f'https://github.com/{repo}/releases/download/{tag}/{name}' for name in (asset, asset + '.sha256')}
 actual = {item.get('browser_download_url') for item in release.get('assets', []) if item.get('state') == 'uploaded'}
 if release.get('tag_name') != tag or not expected <= actual:
-    sys.exit('Elise release assets are missing or do not match the requested version')
+    sys.exit('Elise assets are missing from the requested V2bX release')
 PY
     archive="$work/$asset"
     checksum="$archive.sha256"
@@ -116,7 +116,8 @@ PY
     tar -xOzf "$archive" elise/elise > "$work/elise" || die "Elise binary missing from archive"
     tar -xOzf "$archive" elise/LICENSE > "$work/LICENSE" || die "Elise license missing from archive"
     chmod 0755 "$work/elise"
-    [[ "$("$work/elise" --version)" == "elise ${tag#v}" ]] || die "Elise version or architecture mismatch"
+    binary_version=$("$work/elise" --version) || die "Elise binary cannot run on this host"
+    [[ "$binary_version" =~ ^elise\ [0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]] || die "invalid Elise binary version"
 
     mkdir -p "$bin_dir" "$config_dir"
     chmod 0700 "$config_dir"
@@ -148,7 +149,7 @@ PY
             die "Elise failed to restart; previous binary and service restored"
         fi
     done
-    echo "Installed Elise $tag ($arch). Add a VLESS or VMess node with: V2bX elise add <type> <id>"
+    echo "Installed $binary_version from V2bX $tag ($arch). Add a VLESS or VMess node with: V2bX elise add <type> <id>"
 }
 
 check_v2bx_assignment() {
@@ -401,7 +402,7 @@ uninstall_all() {
 
 usage() {
     cat <<'EOF'
-Usage: V2bX elise install [version]
+Usage: V2bX elise install [V2bX release version]
        V2bX elise add <vless|vmess> <node-id>
        V2bX elise list
        V2bX elise start|stop|restart|status|log <vless-id|vmess-id>
