@@ -116,7 +116,10 @@ impl Inbound for AnytlsInbound {
         *self.padding_scheme.write() = cfg.protocol.padding_scheme;
         info!("AnyTLS configuration loaded successfully from node info");
 
-        let bind_addr = format!("{}:{}", ctx.listen_addr, ctx.port);
+        let bind_addr = match ctx.listen_addr.parse::<IpAddr>() {
+            Ok(address) => SocketAddr::new(address, ctx.port).to_string(),
+            Err(_) => format!("{}:{}", ctx.listen_addr, ctx.port),
+        };
         let listener = bind_tcp_listener(&bind_addr, ctx.global_config.mptcp).await?;
         info!("AnyTLS inbound listening on {}", bind_addr);
 

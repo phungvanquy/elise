@@ -1283,6 +1283,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn anytls_and_hysteria_bind_configured_ipv4_and_ipv6_addresses() {
+        let runner = runner("http://127.0.0.1:1".into());
+        for address in ["127.0.0.1", "::1"] {
+            if address == "::1" && std::net::UdpSocket::bind((address, 0)).is_err() {
+                continue;
+            }
+            for protocol in ["anytls", "hysteria", "hysteria2"] {
+                let port = if protocol == "anytls" {
+                    std::net::TcpListener::bind((address, 0))
+                        .unwrap()
+                        .local_addr()
+                        .unwrap()
+                        .port()
+                } else {
+                    std::net::UdpSocket::bind((address, 0))
+                        .unwrap()
+                        .local_addr()
+                        .unwrap()
+                        .port()
+                };
+                let info = NodeInfo {
+                    node_type: protocol.into(),
+                    server_port: port,
+                    listen_ip: Some(address.into()),
+                    tls: Some(1),
+                    tls_settings: Some(serde_json::json!({"allow_insecure":true})),
+                    ..Default::default()
+                };
+                let mut active = runner
+                    .launch_inbound(&info, &[])
+                    .await
+                    .unwrap_or_else(|e| panic!("{protocol} on {address}: {e}"));
+                if protocol == "anytls" {
+                    assert!(std::net::TcpListener::bind((address, port)).is_err());
+                    if address == "127.0.0.1" {
+                        assert!(std::net::TcpListener::bind(("127.0.0.2", port)).is_ok());
+                    }
+                } else {
+                    assert!(std::net::UdpSocket::bind((address, port)).is_err());
+                    if address == "127.0.0.1" {
+                        assert!(std::net::UdpSocket::bind(("127.0.0.2", port)).is_ok());
+                    }
+                }
+                active.stop().await;
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn inbound_readiness_reports_bind_and_config_failures() {
         let runner = runner("http://127.0.0.1:1".into());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

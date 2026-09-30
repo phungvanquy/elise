@@ -34,7 +34,15 @@ fetch() {
         --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 300 \
         --output "$2" "$1"
 }
-valid_instance() { [[ "${1:-}" =~ ^(vless|vmess)-[1-9][0-9]*$ ]]; }
+normalize_kind() {
+    case "${1,,}" in
+        vless|vmess|anytls|hysteria|hysteria2) printf '%s\n' "${1,,}" ;;
+        hysteria1|hy1) echo hysteria ;;
+        hy2) echo hysteria2 ;;
+        *) return 1 ;;
+    esac
+}
+valid_instance() { [[ "${1:-}" =~ ^(vless|vmess|anytls|hysteria|hysteria2)-[1-9][0-9]*$ ]]; }
 instance_dir() { printf '%s/%s' "$config_dir" "$1"; }
 instance_unit() { printf 'V2bX-elise@%s.service' "$1"; }
 
@@ -84,7 +92,8 @@ installed_instances() {
 
 install_binary() {
     need_root; need_systemd
-    local arch tag asset archive checksum expected actual old_binary old_unit old_license port listen details binary_version
+    local arch tag asset archive checksum expected actual old_binary old_unit old_license port listen preflight transport binary_version
+    local -a details
     case "$(uname -m)" in
         x86_64|amd64) arch=amd64 ;;
         aarch64|arm64) arch=arm64 ;;
@@ -152,18 +161,19 @@ PY
         die "Elise installation failed; previous release restored"
     fi
     for instance in "${active[@]}"; do
-        details=$(panel_port_and_security "$(instance_dir "$instance")/elise.conf" no-bind) || details=""
-        port=${details%%$'\n'*}
+        preflight=$(panel_port_and_security "$(instance_dir "$instance")/elise.conf" no-bind) || preflight=""
+        mapfile -t details <<< "$preflight"
+        port=${details[0]:-}; transport=${details[2]:-}
         listen=$(sed -n 's/^listen=//p' "$(instance_dir "$instance")/elise.conf" | head -n 1)
-        if [[ ! "$port" =~ ^[0-9]+$ ]] ||
+        if [[ ! "$port" =~ ^[0-9]+$ || ! "$transport" =~ ^(tcp|udp)$ ]] ||
            ! systemctl restart "$(instance_unit "$instance")" ||
            ! systemctl is-active --quiet "$(instance_unit "$instance")" ||
-           ! wait_node_port "$listen" "$port"; then
+           ! wait_node_port "$listen" "$port" "$transport"; then
             restore_release "$old_binary" "$old_unit" "$old_license"
             die "Elise failed to restart; previous binary and service restored"
         fi
     done
-    echo "Installed $binary_version from V2bX $tag ($arch). Add a VLESS or VMess node with: V2bX elise add <type> <id>"
+    echo "Installed $binary_version from V2bX $tag ($arch). Add a node with: V2bX elise add <vless|vmess|anytls|hysteria|hysteria2> <id>"
 }
 
 check_v2bx_assignment() {
@@ -235,7 +245,9 @@ for node in data.get('Nodes', []):
     if node.get('Include'):
         sys.exit('V2bX node includes must be reviewed before adding an Elise node')
     api = node.get('ApiConfig') or node
-    if str(api.get('NodeType', '')).lower() == kind and api.get('NodeID') == node_id:
+    node_kind = str(api.get('NodeType', '')).lower()
+    node_kind = {'v2ray': 'vmess', 'hysteria1': 'hysteria', 'hy1': 'hysteria', 'hy2': 'hysteria2'}.get(node_kind, node_kind)
+    if node_kind == kind and api.get('NodeID') == node_id:
         sys.exit(f'{kind} node {node_id} is already managed by the V2bX Go service')
 PY
 }
@@ -258,13 +270,24 @@ try:
 except Exception as exc:
     sys.exit(f'cannot fetch panel node configuration: {exc}')
 data = payload.get('data', payload)
-reported = data.get('server_type') or data.get('protocol') or data.get('node_type')
-if reported and reported.lower() not in (kind, 'v2ray' if kind == 'vmess' else kind):
+reported = data.get('server_type') or data.get('protocol') or data.get('node_type') or data.get('type')
+def protocol(name):
+    name = name.lower()
+    name = {'v2ray': 'vmess', 'hysteria1': 'hysteria', 'hy1': 'hysteria', 'hy': 'hysteria', 'hy2': 'hysteria2'}.get(name, name)
+    if name == 'hysteria' and data.get('version') == 2:
+        return 'hysteria2'
+    return name
+if reported and (not isinstance(reported, str) or protocol(reported) != protocol(kind)):
     sys.exit(f'panel returned {reported}, expected {kind}')
 port = data.get('server_port')
 if not isinstance(port, int) or not (1 <= port <= 65535):
     sys.exit('panel did not return a valid server_port')
-security = data.get('tls', 0)
+requires_tls = kind in ('anytls', 'hysteria', 'hysteria2')
+security = data.get('tls')
+if security is None:
+    security = 1 if requires_tls else 0
+if requires_tls and security != 1:
+    sys.exit(f'{kind} requires TLS mode')
 if kind == 'vmess' and security not in (0, 1):
     sys.exit('VMess supports plain or TLS mode in this installer')
 if kind == 'vless' and security not in (0, 1, 2):
@@ -273,31 +296,53 @@ if security == 2:
     tls = data.get('tls_settings') or data.get('tlsSettings') or {}
     if not (tls.get('private_key') and (tls.get('public_key') or data.get('public_key'))):
         sys.exit('REALITY requires matching private and public keys in the panel')
+transport = 'udp' if kind in ('hysteria', 'hysteria2') else 'tcp'
 if sys.argv[2] != 'no-bind':
     address = values['listen']
     family = socket.AF_INET6 if ':' in address else socket.AF_INET
-    with socket.socket(family, socket.SOCK_STREAM) as sock:
+    socket_type = socket.SOCK_DGRAM if transport == 'udp' else socket.SOCK_STREAM
+    with socket.socket(family, socket_type) as sock:
         try:
             sock.bind((address, port))
         except OSError as exc:
             sys.exit(f'cannot bind {address}:{port}: {exc}')
 print(port)
 print(security)
+print(transport)
 PY
 }
 
 wait_node_port() {
-    python3 - "$1" "$2" <<'PY'
-import socket, sys, time
+    python3 - "$1" "$2" "${3:-tcp}" <<'PY'
+import pathlib, socket, sys, time
 address, port = sys.argv[1], int(sys.argv[2])
-if address == '0.0.0.0': address = '127.0.0.1'
-if address == '::': address = '::1'
+transport = sys.argv[3]
+if transport not in ('tcp', 'udp'):
+    sys.exit('unsupported listener transport')
+if transport == 'tcp':
+    if address == '0.0.0.0': address = '127.0.0.1'
+    if address == '::': address = '::1'
+family = socket.AF_INET6 if ':' in address else socket.AF_INET
+if transport == 'udp':
+    # Read Linux's socket table so a probe cannot take the server's UDP port
+    # while it starts. UDP connect succeeds even when no listener exists.
+    packed = socket.inet_pton(family, address)
+    encoded = ''.join(f'{int.from_bytes(packed[i:i+4], sys.byteorder):08X}' for i in range(0, len(packed), 4))
+    udp_table = pathlib.Path('/proc/net/udp6' if family == socket.AF_INET6 else '/proc/net/udp')
 for _ in range(30):
     try:
-        with socket.create_connection((address, port), timeout=0.5):
-            sys.exit(0)
-    except OSError:
-        time.sleep(0.3)
+        if transport == 'udp':
+            for line in udp_table.read_text().splitlines()[1:]:
+                local, hex_port = line.split()[1].split(':')
+                if local in (encoded, '0' * len(encoded)) and int(hex_port, 16) == port:
+                    sys.exit(0)
+        else:
+            with socket.create_connection((address, port), timeout=0.5):
+                sys.exit(0)
+    except OSError as exc:
+        if transport == 'udp':
+            sys.exit(f'cannot check UDP listener: {exc}')
+    time.sleep(0.3)
 sys.exit('Elise inbound did not open its panel port')
 PY
 }
@@ -306,8 +351,9 @@ add_node() {
     need_root; need_systemd
     [[ -x "$binary" ]] || die "install the Elise binary first"
     ensure_python
-    local kind=${1:-} node_id=${2:-} instance target panel_url panel_key listen cert_file key_file security port
-    [[ "$kind" == vless || "$kind" == vmess ]] || die "type must be vless or vmess"
+    local kind=${1:-} node_id=${2:-} instance target panel_url panel_key listen cert_file key_file security port transport preflight
+    local -a details
+    kind=$(normalize_kind "$kind") || die "type must be vless, vmess, anytls, hysteria (hysteria1/hy1), or hysteria2 (hy2)"
     [[ "$node_id" =~ ^[1-9][0-9]*$ ]] || die "node ID must be a positive integer"
     python3 - "$node_id" <<'PY' || die "node ID exceeds Elise's u32 range"
 import sys
@@ -346,9 +392,10 @@ block_list_file=$target/blockList
 white_list_file=$target/whiteList
 EOF
     chmod 0600 "$work/elise.conf"
-    mapfile -t details < <(panel_port_and_security "$work/elise.conf") || die "panel preflight failed"
-    port=${details[0]:-}; security=${details[1]:-}
-    [[ "$port" =~ ^[0-9]+$ && "$security" =~ ^[0-2]$ ]] || die "panel preflight failed"
+    preflight=$(panel_port_and_security "$work/elise.conf") || die "panel preflight failed"
+    mapfile -t details <<< "$preflight"
+    port=${details[0]:-}; security=${details[1]:-}; transport=${details[2]:-}
+    [[ "$port" =~ ^[0-9]+$ && "$security" =~ ^[0-2]$ && "$transport" =~ ^(tcp|udp)$ ]] || die "panel preflight failed"
     if [[ "$security" == 1 ]]; then
         read -rp 'TLS certificate file (full chain): ' cert_file
         read -rp 'TLS private key file: ' key_file
@@ -365,12 +412,12 @@ EOF
     done
     if ! systemctl enable --now "$(instance_unit "$instance")" ||
        ! systemctl is-active --quiet "$(instance_unit "$instance")" ||
-       ! wait_node_port "$listen" "$port"; then
+       ! wait_node_port "$listen" "$port" "$transport"; then
         systemctl disable --now "$(instance_unit "$instance")" >/dev/null 2>&1 || true
         rm -rf -- "$target"
         die "Elise service failed; inspect journalctl -u $(instance_unit "$instance")"
     fi
-    echo "Elise $instance started on $listen:$port"
+    echo "Elise $instance started on $listen:$port ($transport)"
     if [[ "$security" == 1 ]]; then
         echo "Configure your certificate renewal tool to run: V2bX elise restart $instance"
     fi
@@ -379,7 +426,7 @@ EOF
 service_action() {
     need_root; need_systemd
     local action=$1 instance=${2:-}
-    valid_instance "$instance" || die "use vless-<id> or vmess-<id>"
+    valid_instance "$instance" || die "use <vless|vmess|anytls|hysteria|hysteria2>-<id>"
     [[ -f "$(instance_dir "$instance")/elise.conf" ]] || die "unknown Elise node $instance"
     case "$action" in
         log) journalctl -u "$(instance_unit "$instance")" -n 100 --no-pager ;;
@@ -391,7 +438,7 @@ service_action() {
 remove_node() {
     need_root; need_systemd
     local instance=${1:-}
-    valid_instance "$instance" || die "use vless-<id> or vmess-<id>"
+    valid_instance "$instance" || die "use <vless|vmess|anytls|hysteria|hysteria2>-<id>"
     [[ -d "$(instance_dir "$instance")" ]] || die "unknown Elise node $instance"
     if systemctl is-active --quiet "$(instance_unit "$instance")"; then
         systemctl stop "$(instance_unit "$instance")" || die "could not stop $instance"
@@ -418,11 +465,13 @@ uninstall_all() {
 usage() {
     cat <<'EOF'
 Usage: V2bX elise install [V2bX release version]
-       V2bX elise add <vless|vmess> <node-id>
+       V2bX elise add <vless|vmess|anytls|hysteria|hysteria2> <node-id>
        V2bX elise list
-       V2bX elise start|stop|restart|status|log <vless-id|vmess-id>
-       V2bX elise remove <vless-id|vmess-id>
+       V2bX elise start|stop|restart|status|log <protocol-id>
+       V2bX elise remove <protocol-id>
        V2bX elise uninstall
+
+Hysteria aliases: hysteria1/hy1 -> hysteria; hy2 -> hysteria2.
 EOF
 }
 

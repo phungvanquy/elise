@@ -203,9 +203,12 @@ impl Inbound for Hysteria2Inbound {
             ctx.port
         };
 
-        let bind_addr: SocketAddr = format!("0.0.0.0:{}", port)
-            .parse()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let bind_addr = SocketAddr::new(
+            ctx.listen_addr
+                .parse()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
+            port,
+        );
 
         let std_socket = std::net::UdpSocket::bind(bind_addr)?;
         std_socket.set_nonblocking(true)?;

@@ -6,6 +6,22 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+fn resolve_node_type(name: &str, version: Option<u32>) -> String {
+    let name = name.to_ascii_lowercase();
+    match name.as_str() {
+        "v2ray" => "vmess".into(),
+        "hysteria" | "hysteria1" | "hy" | "hy1" => {
+            if version == Some(2) {
+                "hysteria2".into()
+            } else {
+                "hysteria".into()
+            }
+        }
+        "hy2" => "hysteria2".into(),
+        _ => name,
+    }
+}
+
 pub struct XboardClient {
     client: Client,
     base_url: String,
@@ -63,6 +79,11 @@ impl XboardClient {
         let val: Value = resp.json().await?;
         let data = val.get("data").unwrap_or(&val);
 
+        let version = data
+            .get("version")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+
         let reported_type = data
             .get("server_type")
             .or_else(|| data.get("protocol"))
@@ -70,28 +91,18 @@ impl XboardClient {
             .or_else(|| data.get("type"))
             .and_then(|v| v.as_str());
         if let (Some(expected), Some(reported)) = (self.node_type.as_deref(), reported_type) {
-            if !expected.eq_ignore_ascii_case(reported)
-                && !(expected == "vmess" && reported.eq_ignore_ascii_case("v2ray"))
-            {
+            if resolve_node_type(expected, version) != resolve_node_type(reported, version) {
                 return Err(format!(
                     "Panel node type {reported} does not match configured {expected}"
                 )
                 .into());
             }
         }
-        let mut node_type = self
+        let node_type = self
             .node_type
-            .clone()
-            .unwrap_or_else(|| reported_type.unwrap_or("vless").to_string());
-
-        let version = data
-            .get("version")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32);
-
-        if (node_type == "hysteria" || node_type == "hy") && version == Some(2) {
-            node_type = "hysteria2".to_string();
-        }
+            .as_deref()
+            .unwrap_or(reported_type.unwrap_or("vless"));
+        let node_type = resolve_node_type(node_type, version);
 
         let mut info = NodeInfo {
             id: node_id,
@@ -495,6 +506,73 @@ impl XboardClient {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn v2bx_anytls_and_hysteria_resolve_panel_types_and_versions() {
+        for (configured, reported, version, expected) in [
+            ("anytls", "AnyTLS", None, Some("anytls")),
+            ("hysteria", "hysteria1", Some(1), Some("hysteria")),
+            ("hysteria", "hy1", None, Some("hysteria")),
+            ("hysteria", "hysteria", Some(2), Some("hysteria2")),
+            ("hysteria2", "hysteria", Some(2), Some("hysteria2")),
+            ("hysteria2", "hy2", Some(2), Some("hysteria2")),
+            ("hysteria2", "hysteria", Some(1), None),
+            ("anytls", "vless", None, None),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = XboardClient::new_with_node_type(
+                format!("http://{}", listener.local_addr().unwrap()),
+                "key+value".into(),
+                Some(configured.into()),
+            );
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(stream.read_u8().await.unwrap());
+                }
+                let request = String::from_utf8(request).unwrap();
+                let target = request.split_whitespace().nth(1).unwrap();
+                let url = reqwest::Url::parse(&format!("http://localhost{target}")).unwrap();
+                assert_eq!(url.path(), "/api/v1/server/UniProxy/config");
+                let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
+                assert_eq!(query.get("node_type").map(String::as_str), Some(configured));
+                assert_eq!(query.get("node_id").map(String::as_str), Some("9"));
+                let body = serde_json::json!({"data": {
+                    "server_type": reported, "version": version, "server_port": 12345,
+                    "tls": 1, "up_mbps": 100, "down_mbps": 200,
+                    "obfs": "salamander", "obfs_password": "fixture",
+                    "padding_scheme": "stop=8"
+                }})
+                .to_string();
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            });
+            let result = client.get_node_info(9).await;
+            if let Some(expected) = expected {
+                let info = result.unwrap();
+                assert_eq!(info.node_type, expected);
+                assert_eq!(info.version, version);
+                assert_eq!(info.tls, Some(1));
+                assert_eq!(info.up_mbps, Some(100));
+                assert_eq!(info.down_mbps, Some(200));
+                assert_eq!(info.obfs_password.as_deref(), Some("fixture"));
+                assert_eq!(info.padding_scheme, Some(serde_json::json!("stop=8")));
+                assert!(crate::proxy::registry::create_inbound(&info.node_type).is_ok());
+            } else {
+                assert!(result.unwrap_err().to_string().contains("does not match"));
+            }
+            server.await.unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn v2bx_vmess_uses_typed_uniproxy_requests_and_alive_map() {
