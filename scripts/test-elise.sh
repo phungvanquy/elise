@@ -155,7 +155,7 @@ try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.bind(('127.0.0.1', 0))
             port = sock.getsockname()[1]
-        result = run_helper('wait_node_port 127.0.0.1 "$1" udp', port)
+        result = run_helper('wait_node_port 127.0.0.1 "$1" udp 0.5', port)
         assert result.returncode != 0 and 'did not open' in result.stderr, result
 
         for kind in ('vmess', 'anytls', 'hysteria', 'hysteria2'):
@@ -171,8 +171,9 @@ try:
         v2bx_config.write_text('{"Nodes":[]}')
         cert = Path(root) / 'cert.pem'
         key = Path(root) / 'key.pem'
-        cert.write_text('fixture certificate')
-        key.write_text('fixture key')
+        subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
+                        '-subj', '/CN=node.example.com', '-addext', 'subjectAltName=DNS:node.example.com',
+                        '-out', str(cert), '-keyout', str(key)], check=True, capture_output=True)
         service_log = Path(root) / 'services.log'
         env.update({
             'ELISE_SERVICE_LOG': str(service_log),
@@ -205,7 +206,7 @@ systemctl() {
             result = run_helper(
                 service_setup + 'add_node "$1" 9; installed_instances; service_action restart "$2"',
                 config_root, requested, instance,
-                input=f'http://127.0.0.1:{server.server_port}\nkey+value\n127.0.0.1\n{cert}\n{key}\n',
+                input=f'http://127.0.0.1:{server.server_port}\nkey+value\n127.0.0.1\n1\n{cert}\n{key}\n',
                 check=True,
             )
             config = config_root / instance / 'elise.conf'
@@ -220,6 +221,70 @@ systemctl() {
             assert not config.parent.exists()
             server.node_listener.close()
             server.node_listener = None
+
+        for domain in ('*.example.com', 'https://node.example.com', '../bad', '127.0.0.1', 'node', '-bad.example.com', 'bad#.example.com'):
+            assert run_helper('validate_tls_domain "$1"', domain).returncode != 0, domain
+        run_helper('validate_tls_domain node.example.com', check=True)
+        assert run_helper('http_tls_preflight node.example.com 80 tcp').returncode != 0
+        # No requests to a public CA: fake systemd opens the inbound as above,
+        # and the HTTP preflight is stubbed only in automatic-mode wizard tests.
+        for kind in ('anytls', 'hysteria', 'hysteria2'):
+            for mode in ('2', '3'):
+                transport = 'udp' if kind.startswith('hysteria') else 'tcp'
+                server.node_transport = socket.SOCK_DGRAM if transport == 'udp' else socket.SOCK_STREAM
+                with socket.socket(socket.AF_INET, server.node_transport) as sock:
+                    sock.bind(('127.0.0.1', 0))
+                    server.node_port = sock.getsockname()[1]
+                configure_panel(kind, {'server_port': server.node_port})
+                instance = f'{kind}-9'
+                result = run_helper(
+                    service_setup + 'http_tls_preflight() { :; }; add_node "$1" 9',
+                    config_root, kind,
+                    input=f'http://127.0.0.1:{server.server_port}\nkey+value\n127.0.0.1\n{mode}\nnode.example.com\nadmin@example.com\n',
+                    check=True,
+                )
+                config = config_root / instance / 'elise.conf'
+                contents = config.read_text()
+                cert_path = config.parent / 'cert/fullchain.pem'
+                key_path = config.parent / 'cert/privkey.pem'
+                assert f'cert_file={cert_path}\nkey_file={key_path}\n' in contents
+                assert 'cert_domain=node.example.com\n' in contents and 'auto_tls=false\n' in contents
+                if mode == '2':
+                    assert 'cert_mode=http\n' in contents and 'acme_email=admin@example.com\n' in contents
+                    assert 'renew' in result.stdout and not cert_path.exists()
+                    assert run_helper('startup_timeout "$1"', config, check=True).stdout.strip() == '300'
+                else:
+                    assert 'cert_mode=file\n' in contents and 'Trust this certificate' in result.stdout
+                    assert key_path.stat().st_mode & 0o777 == 0o600
+                    import ssl
+                    ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(cert_path, key_path)
+                    decoded = ssl._ssl._test_decode_cert(str(cert_path))
+                    assert ('DNS', 'node.example.com') in decoded['subjectAltName']
+                    before = cert_path.read_bytes()
+                    run_helper(service_setup + 'service_action restart "$1"', config_root, instance, check=True)
+                    assert cert_path.read_bytes() == before
+                    assert run_helper('startup_timeout "$1"', config, check=True).stdout.strip() == '15'
+                run_helper(service_setup + 'remove_node "$1"', config_root, instance, check=True)
+                server.node_listener.close()
+                server.node_listener = None
+
+        configure_panel('anytls', {'server_port': server.node_port})
+        # A failed first start retains the config/certificate for diagnosis and
+        # retry; repeatedly deleting them can trigger unnecessary CA orders.
+        result = run_helper(
+            service_setup + 'systemctl() { return 1; }; add_node anytls 9', config_root,
+            input=f'http://127.0.0.1:{server.server_port}\nkey+value\n127.0.0.1\n3\nnode.example.com\n',
+        )
+        assert result.returncode != 0 and 'retained' in result.stderr
+        assert (config_root / 'anytls-9/cert/privkey.pem').exists()
+        run_helper(service_setup + 'remove_node anytls-9', config_root, check=True)
+
+        bad_key = Path(root) / 'bad-key.pem'
+        bad_key.write_text('not a private key')
+        result = run_helper(service_setup + 'add_node anytls 9', config_root,
+                            input=f'http://127.0.0.1:{server.server_port}\nkey+value\n127.0.0.1\n1\n{cert}\n{bad_key}\n')
+        assert result.returncode != 0 and 'invalid TLS certificate' in result.stderr
+        assert not (config_root / 'anytls-9').exists()
 finally:
     if server.node_listener:
         server.node_listener.close()

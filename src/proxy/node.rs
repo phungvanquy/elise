@@ -217,7 +217,12 @@ impl NodeRunner {
             || self.node_config.read().cert_mode.as_deref() == Some("acme")
         {
             let mut cfg_clone = self.node_config.read().clone();
-            match crate::security::ensure_acme_certificate(&mut cfg_clone, &node_info).await {
+            let certificate = tokio::select! {
+                biased;
+                _ = shutdown_rx.recv() => return,
+                result = crate::security::ensure_acme_certificate(&mut cfg_clone, &node_info) => result,
+            };
+            match certificate {
                 Ok(acme_cfg) => {
                     *self.node_config.write() = cfg_clone;
                     info!(
@@ -232,8 +237,9 @@ impl NodeRunner {
                     error!(
                         node_id = self.node_id,
                         error = %e,
-                        "Failed to obtain/verify ACME certificate; continuing with existing config"
+                        "Failed to obtain a usable ACME certificate; node not started"
                     );
+                    return;
                 }
             }
         }
@@ -269,16 +275,19 @@ impl NodeRunner {
 
         self.apply_node_routes(&node_info);
 
+        let (certificate_updates, certificate_rx) = tokio::sync::watch::channel(());
         let inbound_task = {
             let runner = self.clone();
             let shutdown_sub = shutdown_rx.resubscribe();
             let node_info_clone = node_info.clone();
             tokio::spawn(async move {
-                runner.run_inbound(node_info_clone, shutdown_sub).await;
+                runner
+                    .run_inbound(node_info_clone, shutdown_sub, certificate_rx)
+                    .await;
             })
         };
 
-        let _acme_task = {
+        let acme_task = {
             let runner = self.clone();
             let mut shutdown_sub = shutdown_rx.resubscribe();
             let node_info_snapshot = node_info.clone();
@@ -295,9 +304,13 @@ impl NodeRunner {
                         _ = shutdown_sub.recv() => break,
                         _ = ticker.tick() => {
                             let mut cfg_clone = runner.node_config.read().clone();
+                            let previous = cfg_clone.cert_file.as_ref().and_then(|path| std::fs::read(path).ok());
                             match crate::security::ensure_acme_certificate(&mut cfg_clone, &node_info_snapshot).await {
                                 Ok(acme_cfg) => {
                                     *runner.node_config.write() = cfg_clone;
+                                    if std::fs::read(&acme_cfg.cert_file).ok() != previous {
+                                        let _ = certificate_updates.send(());
+                                    }
                                     info!(
                                         node_id = runner.node_id,
                                         domain = %acme_cfg.domain,
@@ -479,7 +492,7 @@ impl NodeRunner {
         info!("NodeRunner {} shutting down", self.node_id);
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        for mut task in [report_task, rules_sync_task, local_watch_task] {
+        for mut task in [report_task, rules_sync_task, local_watch_task, acme_task] {
             if inbound_finished || tokio::time::timeout_at(deadline, &mut task).await.is_err() {
                 task.abort();
                 let _ = task.await;
@@ -609,6 +622,7 @@ impl NodeRunner {
         self: Arc<Self>,
         mut info: NodeInfo,
         mut shutdown: broadcast::Receiver<()>,
+        mut certificate_updates: tokio::sync::watch::Receiver<()>,
     ) {
         let mut users = Vec::new();
         let mut active = match self.launch_inbound(&info, &users).await {
@@ -626,64 +640,113 @@ impl NodeRunner {
             .unwrap_or(self.global_config.node_sync_interval)
             .max(10);
         let mut ticker = tokio::time::interval(Duration::from_secs(interval));
+        let mut watch_certificates = true;
         loop {
-            tokio::select! {
+            let certificate_changed = tokio::select! {
                 biased;
                 _ = shutdown.recv() => break,
                 result = retired.join_next(), if !retired.is_empty() => {
                     if let Some(Err(e)) = result { warn!(error = %e, "Retired inbound task failed"); }
+                    continue;
                 }
-                _ = ticker.tick() => {
-                    let update = async {
-                        if let Some(synced) = self.sync_users(&active.inbound).await { users = synced; }
-                        let mut next = match self.panel_client.get_node_info(self.node_id).await {
-                            Ok(next) => next,
-                            Err(e) => { warn!(node_id = self.node_id, error = %e, "Node sync failed; keeping active configuration"); return; }
-                        };
-                        let nodes_dir = self.global_config.nodes_dir.clone().unwrap_or_else(|| {
-                            if std::path::Path::new("/etc/elise").exists() {
-                                std::path::PathBuf::from("/etc/elise/nodes")
-                            } else {
-                                std::path::PathBuf::from("./nodes")
-                            }
-                        });
-                        if let Err(e) = self.node_config.read().prepare_node_info(&nodes_dir, &mut next) {
-                            warn!(node_id = self.node_id, error = %e, "Invalid node security update; keeping active configuration");
+                result = certificate_updates.changed(), if watch_certificates => {
+                    if result.is_err() {
+                        watch_certificates = false;
+                        continue;
+                    }
+                    true
+                }
+                _ = ticker.tick() => false,
+            };
+            let update = async {
+                // Renewal must reach the listener even during a panel outage.
+                let mut next = if certificate_changed {
+                    info.clone()
+                } else {
+                    if let Some(synced) = self.sync_users(&active.inbound).await {
+                        users = synced;
+                    }
+                    match self.panel_client.get_node_info(self.node_id).await {
+                        Ok(next) => next,
+                        Err(e) => {
+                            warn!(node_id = self.node_id, error = %e, "Node sync failed; keeping active configuration");
                             return;
                         }
-                        if serde_json::to_value(&next).ok() == serde_json::to_value(&info).ok() && !active.task.is_finished() { return; }
-                        let next_ctx = match self.inbound_context(&next) {
-                            Ok(ctx) => ctx,
-                            Err(e) => { warn!(error = %e, "Invalid node update; keeping active configuration"); return; }
-                        };
-                        let old_ctx = self.inbound_context(&info).expect("Previously validated context");
-                        let same_address = next_ctx.port == old_ctx.port && next_ctx.listen_addr == old_ctx.listen_addr;
-                        if same_address { active.stop().await; }
-                        match self.launch_inbound(&next, &users).await {
-                            Ok(candidate) => {
-                                let mut old = std::mem::replace(&mut active, candidate);
-                                retired.spawn(async move { old.stop().await; });
-                                self.apply_node_routes(&next);
-                                info = next;
-                                if let Err(e) = self.node_config.read().save_node_conf(&nodes_dir, &info) {
-                                    warn!(node_id = self.node_id, error = %e, "Failed to update node AUTO settings");
-                                }
-                                info!(node_id = self.node_id, port = info.server_port, "Node configuration reloaded");
-                            }
-                            Err(e) => {
-                                warn!(node_id = self.node_id, error = %e, "Node update failed; keeping previous configuration");
-                                if same_address {
-                                    match self.launch_inbound(&info, &users).await {
-                                        Ok(previous) => active = previous,
-                                        Err(e) => error!(node_id = self.node_id, error = %e, "Failed to restore previous listener"),
-                                    }
+                    }
+                };
+                let nodes_dir = self.global_config.nodes_dir.clone().unwrap_or_else(|| {
+                    if std::path::Path::new("/etc/elise").exists() {
+                        std::path::PathBuf::from("/etc/elise/nodes")
+                    } else {
+                        std::path::PathBuf::from("./nodes")
+                    }
+                });
+                if let Err(e) = self
+                    .node_config
+                    .read()
+                    .prepare_node_info(&nodes_dir, &mut next)
+                {
+                    warn!(node_id = self.node_id, error = %e, "Invalid node security update; keeping active configuration");
+                    return;
+                }
+                if !certificate_changed
+                    && serde_json::to_value(&next).ok() == serde_json::to_value(&info).ok()
+                    && !active.task.is_finished()
+                {
+                    return;
+                }
+                let next_ctx = match self.inbound_context(&next) {
+                    Ok(ctx) => ctx,
+                    Err(e) => {
+                        warn!(error = %e, "Invalid node update; keeping active configuration");
+                        return;
+                    }
+                };
+                let old_ctx = self
+                    .inbound_context(&info)
+                    .expect("Previously validated context");
+                let same_address =
+                    next_ctx.port == old_ctx.port && next_ctx.listen_addr == old_ctx.listen_addr;
+                if same_address {
+                    active.stop().await;
+                }
+                let candidate = if same_address {
+                    self.launch_replacement(&next, &users).await
+                } else {
+                    self.launch_inbound(&next, &users).await
+                };
+                match candidate {
+                    Ok(candidate) => {
+                        let mut old = std::mem::replace(&mut active, candidate);
+                        retired.spawn(async move {
+                            old.stop().await;
+                        });
+                        self.apply_node_routes(&next);
+                        info = next;
+                        if let Err(e) = self.node_config.read().save_node_conf(&nodes_dir, &info) {
+                            warn!(node_id = self.node_id, error = %e, "Failed to update node AUTO settings");
+                        }
+                        info!(
+                            node_id = self.node_id,
+                            port = info.server_port,
+                            certificate_changed,
+                            "Node configuration reloaded"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(node_id = self.node_id, error = %e, "Node update failed; keeping previous configuration");
+                        if same_address {
+                            match self.launch_replacement(&info, &users).await {
+                                Ok(previous) => active = previous,
+                                Err(e) => {
+                                    error!(node_id = self.node_id, error = %e, "Failed to restore previous listener")
                                 }
                             }
                         }
-                    };
-                    tokio::select! { biased; _ = shutdown.recv() => break, _ = update => {} }
+                    }
                 }
-            }
+            };
+            tokio::select! { biased; _ = shutdown.recv() => break, _ = update => {} }
         }
         active.stop().await;
         while retired.join_next().await.is_some() {}
@@ -732,6 +795,28 @@ impl NodeRunner {
             }
         }
         Ok(active)
+    }
+
+    async fn launch_replacement(
+        &self,
+        info: &NodeInfo,
+        users: &[User],
+    ) -> std::io::Result<ActiveInbound> {
+        // QUIC's driver can retain the UDP socket while closed connections
+        // drain, even after the inbound task exits. Wait for it to release the
+        // port before considering a same-address reload a failure.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match self.launch_inbound(info, users).await {
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::AddrInUse
+                        && tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                result => return result,
+            }
+        }
     }
 
     async fn sync_users(&self, inbound: &Arc<dyn Inbound>) -> Option<Vec<User>> {
@@ -1176,6 +1261,138 @@ mod tests {
             .unwrap();
         assert_eq!(runner.traffic_buffer.lock().get(&42), Some(&(44, 44)));
         active.stop().await;
+    }
+
+    #[tokio::test]
+    async fn certificate_renewal_reloads_tls_and_quic_without_panel_access() {
+        async fn peer_certificate(
+            protocol: &str,
+            port: u16,
+            roots: rustls::RootCertStore,
+        ) -> Option<Vec<u8>> {
+            let mut tls = rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            if protocol == "anytls" {
+                let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                    .await
+                    .ok()?;
+                let connector = tokio_rustls::TlsConnector::from(Arc::new(tls));
+                let stream = connector
+                    .connect("node.example.com".try_into().unwrap(), stream)
+                    .await
+                    .ok()?;
+                Some(stream.get_ref().1.peer_certificates()?[0].to_vec())
+            } else {
+                tls.alpn_protocols = vec![if protocol == "hysteria" {
+                    b"hysteria".to_vec()
+                } else {
+                    b"h3".to_vec()
+                }];
+                let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
+                let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+                endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(crypto)));
+                let connection = endpoint
+                    .connect(([127, 0, 0, 1], port).into(), "node.example.com")
+                    .ok()?
+                    .await
+                    .ok()?;
+                let identity = connection
+                    .peer_identity()?
+                    .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+                    .ok()?;
+                let cert = identity[0].to_vec();
+                connection.close(0u32.into(), b"test complete");
+                Some(cert)
+            }
+        }
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        for protocol in ["anytls", "hysteria", "hysteria2"] {
+            let dir = std::env::temp_dir().join(format!("elise-renew-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let cert_path = dir.join("fullchain.pem");
+            let key_path = dir.join("privkey.pem");
+            let first =
+                rcgen::generate_simple_self_signed(vec!["node.example.com".into()]).unwrap();
+            let second =
+                rcgen::generate_simple_self_signed(vec!["node.example.com".into()]).unwrap();
+            std::fs::write(&cert_path, first.cert.pem()).unwrap();
+            std::fs::write(&key_path, first.key_pair.serialize_pem()).unwrap();
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(first.cert.der().clone()).unwrap();
+            roots.add(second.cert.der().clone()).unwrap();
+            let port = if protocol == "anytls" {
+                std::net::TcpListener::bind("127.0.0.1:0")
+                    .unwrap()
+                    .local_addr()
+                    .unwrap()
+                    .port()
+            } else {
+                std::net::UdpSocket::bind("127.0.0.1:0")
+                    .unwrap()
+                    .local_addr()
+                    .unwrap()
+                    .port()
+            };
+            let mut runner = runner("http://127.0.0.1:1".into());
+            Arc::get_mut(&mut runner.global_config).unwrap().nodes_dir = Some(dir.join("nodes"));
+            *runner.node_config.write() = NodeConfig {
+                cert_file: Some(cert_path.clone()),
+                key_file: Some(key_path.clone()),
+                cert_domain: Some("node.example.com".into()),
+                ..Default::default()
+            };
+            let mut info = NodeInfo {
+                node_type: protocol.into(),
+                server_port: port,
+                listen_ip: Some("127.0.0.1".into()),
+                tls: Some(1),
+                ..Default::default()
+            };
+            runner
+                .node_config
+                .read()
+                .prepare_node_info(&dir.join("nodes"), &mut info)
+                .unwrap();
+            let (shutdown, rx) = broadcast::channel(1);
+            let (updates, certificate_rx) = tokio::sync::watch::channel(());
+            let task = tokio::spawn(Arc::new(runner).run_inbound(info, rx, certificate_rx));
+            for expected in [first.cert.der(), second.cert.der()] {
+                if expected == second.cert.der() {
+                    std::fs::write(&cert_path, second.cert.pem()).unwrap();
+                    std::fs::write(&key_path, second.key_pair.serialize_pem()).unwrap();
+                    updates.send(()).unwrap();
+                }
+                tokio::time::timeout(Duration::from_secs(8), async {
+                    loop {
+                        if let Ok(Some(cert)) = tokio::time::timeout(
+                            Duration::from_millis(500),
+                            peer_certificate(protocol, port, roots.clone()),
+                        )
+                        .await
+                        {
+                            if cert == expected.as_ref() {
+                                break;
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "{protocol} did not serve the expected certificate (renewed={})",
+                        expected == second.cert.der()
+                    )
+                });
+            }
+            shutdown.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(3), task)
+                .await
+                .unwrap()
+                .unwrap();
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[tokio::test]

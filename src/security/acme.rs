@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::config::node::NodeConfig;
 use crate::panel::types::NodeInfo;
@@ -56,6 +56,10 @@ pub fn check_cert_validity(cert_path: &Path, renew_before_days: u64) -> CertStat
         .unwrap_or_default()
         .as_secs() as i64;
 
+    if cert.validity().not_before.timestamp() > now {
+        return CertStatus::Invalid("certificate is not valid yet".into());
+    }
+
     let renew_seconds = (renew_before_days as i64) * 86400;
     if not_after - now > renew_seconds {
         CertStatus::Valid { not_after }
@@ -71,20 +75,24 @@ struct Http01ChallengeServer {
 
 impl Http01ChallengeServer {
     pub async fn start() -> Result<Self, String> {
-        let tokens = Arc::new(RwLock::new(HashMap::<String, String>::new()));
-        let listener = match TcpListener::bind("0.0.0.0:80").await {
-            Ok(l) => l,
-            Err(e) => {
-                error!(
-                    "ACME HTTP-01: Failed to bind port 80 (0.0.0.0:80): {}. \
-                    Let's Encrypt HTTP-01 challenge requires incoming access on port 80.",
-                    e
-                );
-                return Err(format!("Cannot bind port 80 for HTTP-01 challenge: {e}"));
+        // Binding is the cross-process lock: each Elise service waits its turn
+        // to answer HTTP-01 on the same host. Never stop an existing web server.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        let listener = loop {
+            match bind_http_listener(80) {
+                Ok(listener) => break listener,
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                Err(e) => return Err(format!("Cannot bind TCP port 80 for HTTP-01: {e}; keep port 80 free and publicly reachable")),
             }
         };
+        Ok(Self::serve(listener))
+    }
 
-        info!("ACME HTTP-01 challenge responder listening on 0.0.0.0:80");
+    fn serve(listener: TcpListener) -> Self {
+        let tokens = Arc::new(RwLock::new(HashMap::<String, String>::new()));
+        info!(address = ?listener.local_addr(), "ACME HTTP-01 challenge responder listening");
 
         let (shutdown_tx, _) = broadcast::channel(1);
         let mut shutdown_rx = shutdown_tx.subscribe();
@@ -106,8 +114,8 @@ impl Http01ChallengeServer {
 
                         tokio::spawn(async move {
                             let mut buf = [0u8; 2048];
-                            let n = match stream.read(&mut buf).await {
-                                Ok(n) if n > 0 => n,
+                            let n = match tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buf)).await {
+                                Ok(Ok(n)) if n > 0 => n,
                                 _ => return,
                             };
 
@@ -146,10 +154,10 @@ impl Http01ChallengeServer {
             }
         });
 
-        Ok(Self {
+        Self {
             tokens,
             shutdown_tx,
-        })
+        }
     }
 
     pub fn add_token(&self, token: String, key_auth: String) {
@@ -161,7 +169,40 @@ impl Http01ChallengeServer {
     }
 }
 
+fn bind_http_listener(port: u16) -> std::io::Result<TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    // A dual-stack socket answers both A and AAAA records. Fall back only when
+    // IPv6 is unavailable, not when another process owns the IPv6 port.
+    let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))
+        .and_then(|socket| {
+            socket.set_only_v6(false)?;
+            socket.set_reuse_address(true)?;
+            socket.bind(&std::net::SocketAddr::from(([0u16; 8], port)).into())?;
+            Ok(socket)
+        })
+        .or_else(|e| {
+            if e.kind() == std::io::ErrorKind::AddrInUse
+                || e.kind() == std::io::ErrorKind::PermissionDenied
+            {
+                return Err(e);
+            }
+            let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+            socket.set_reuse_address(true)?;
+            socket.bind(&std::net::SocketAddr::from(([0, 0, 0, 0], port)).into())?;
+            Ok(socket)
+        })?;
+    socket.listen(128)?;
+    socket.set_nonblocking(true)?;
+    TcpListener::from_std(socket.into())
+}
+
 pub async fn obtain_certificate(config: &AcmeConfig) -> Result<(), String> {
+    tokio::time::timeout(Duration::from_secs(240), issue_certificate(config))
+        .await
+        .map_err(|_| "ACME issuance timed out after 240 seconds".to_string())?
+}
+
+async fn issue_certificate(config: &AcmeConfig) -> Result<(), String> {
     info!(
         domain = %config.domain,
         server = %config.acme_server,
@@ -305,44 +346,8 @@ pub async fn obtain_certificate(config: &AcmeConfig) -> Result<(), String> {
 
     let private_key_pem = key_pair.serialize_pem();
 
-    if let Some(parent) = config.cert_file.parent() {
-        if !parent.as_os_str().is_empty() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                format!("Failed to create cert directory {}: {e}", parent.display())
-            })?;
-        }
-    }
-    if let Some(parent) = config.key_file.parent() {
-        if !parent.as_os_str().is_empty() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| format!("Failed to create key directory {}: {e}", parent.display()))?;
-        }
-    }
-
-    tokio::fs::write(&config.cert_file, cert_chain_pem.as_bytes())
-        .await
-        .map_err(|e| {
-            format!(
-                "Failed to write cert_file {}: {e}",
-                config.cert_file.display()
-            )
-        })?;
-
-    tokio::fs::write(&config.key_file, private_key_pem.as_bytes())
-        .await
-        .map_err(|e| {
-            format!(
-                "Failed to write key_file {}: {e}",
-                config.key_file.display()
-            )
-        })?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&config.key_file, std::fs::Permissions::from_mode(0o600));
-    }
+    validate_certificate_pair(&cert_chain_pem, &private_key_pem, &config.domain)?;
+    save_certificate_pair(config, &cert_chain_pem, &private_key_pem)?;
 
     info!(
         cert_file = %config.cert_file.display(),
@@ -351,6 +356,87 @@ pub async fn obtain_certificate(config: &AcmeConfig) -> Result<(), String> {
     );
 
     Ok(())
+}
+
+fn validate_certificate_pair(cert: &str, key: &str, domain: &str) -> Result<(), String> {
+    let chain = super::tls::parse_pem_certificates(cert)?;
+    let key = super::tls::parse_pem_private_key(key)?;
+    let (_, leaf) = x509_parser::parse_x509_certificate(chain[0].as_ref())
+        .map_err(|e| format!("invalid leaf certificate: {e}"))?;
+    let san = leaf
+        .subject_alternative_name()
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "certificate has no subject alternative names".to_string())?;
+    if !san.value.general_names.iter().any(|name| {
+        matches!(name,
+        x509_parser::extensions::GeneralName::DNSName(name) if name.eq_ignore_ascii_case(domain))
+    }) {
+        return Err(format!("certificate does not cover {domain}"));
+    }
+    rustls::sign::CertifiedKey::from_der(chain, key, &rustls::crypto::ring::default_provider())
+        .map_err(|e| format!("invalid certificate/key pair: {e}"))?
+        .keys_match()
+        .map_err(|e| format!("certificate/key mismatch: {e}"))
+}
+
+fn check_acme_certificate(config: &AcmeConfig, renew_before_days: u64) -> CertStatus {
+    let pair = std::fs::read_to_string(&config.cert_file)
+        .and_then(|cert| std::fs::read_to_string(&config.key_file).map(|key| (cert, key)));
+    match pair {
+        Ok((cert, key)) => {
+            if let Err(e) = validate_certificate_pair(&cert, &key, &config.domain) {
+                return CertStatus::Invalid(e);
+            }
+            check_cert_validity(&config.cert_file, renew_before_days)
+        }
+        Err(e) => CertStatus::Invalid(format!("cannot read certificate/key: {e}")),
+    }
+}
+
+fn save_certificate_pair(config: &AcmeConfig, cert: &str, key: &str) -> Result<(), String> {
+    use std::io::Write;
+    if config.cert_file == config.key_file {
+        return Err("cert_file and key_file must be different paths".into());
+    }
+    let suffix = format!("tmp-{}", uuid::Uuid::new_v4());
+    let cert_temp = config.cert_file.with_extension(&suffix);
+    let key_temp = config.key_file.with_extension(format!("key-{suffix}"));
+    let result = (|| -> std::io::Result<()> {
+        for (path, contents) in [(&cert_temp, cert), (&key_temp, key)] {
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(path)?;
+            file.write_all(contents.as_bytes())?;
+            file.sync_all()?;
+        }
+        let old_key = match std::fs::read(&config.key_file) {
+            Ok(key) => Some(key),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        std::fs::rename(&key_temp, &config.key_file)?;
+        if let Err(e) = std::fs::rename(&cert_temp, &config.cert_file) {
+            // Keep the old usable pair if the final replacement fails.
+            if let Some(old_key) = old_key {
+                std::fs::write(&config.key_file, old_key)?;
+            } else {
+                std::fs::remove_file(&config.key_file)?;
+            }
+            return Err(e);
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(cert_temp);
+    let _ = std::fs::remove_file(key_temp);
+    result.map_err(|e| format!("failed to save ACME certificate/key: {e}"))
 }
 
 pub async fn ensure_acme_certificate(
@@ -373,6 +459,24 @@ pub async fn ensure_acme_certificate(
         .ok_or_else(|| {
             "ACME is enabled (cert_mode = http), but no domain specified in cert_domain or panel server_name".to_string()
         })?;
+
+    if domain.len() > 253
+        || !domain.contains('.')
+        || domain.parse::<std::net::IpAddr>().is_ok()
+        || !domain.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label.as_bytes()[0].is_ascii_alphanumeric()
+                && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
+                && label
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+        })
+    {
+        return Err(
+            "HTTP-01 requires a DNS hostname in cert_domain (no URL, wildcard, or IP)".into(),
+        );
+    }
 
     let cert_file = match &node_cfg.cert_file {
         Some(path) => crate::config::node::normalize_cert_path(path),
@@ -425,7 +529,7 @@ pub async fn ensure_acme_certificate(
         node_cfg.cert_domain = Some(acme_config.domain.clone());
     }
 
-    match check_cert_validity(&cert_file, 30) {
+    match check_acme_certificate(&acme_config, 30) {
         CertStatus::Valid { not_after } => {
             info!(
                 domain = %acme_config.domain,
@@ -442,7 +546,16 @@ pub async fn ensure_acme_certificate(
                 status = ?status,
                 "Certificate missing, invalid, or expiring within 30 days; obtaining new certificate via ACME"
             );
-            obtain_certificate(&acme_config).await?;
+            if let Err(e) = obtain_certificate(&acme_config).await {
+                if matches!(
+                    check_acme_certificate(&acme_config, 0),
+                    CertStatus::Valid { .. }
+                ) {
+                    warn!(domain = %acme_config.domain, error = %e, "ACME renewal failed; keeping still-valid certificate and retrying at next check");
+                } else {
+                    return Err(e);
+                }
+            }
             Ok(acme_config)
         }
     }
@@ -454,6 +567,148 @@ mod tests {
     use rcgen::{CertificateParams, KeyPair};
     use std::fs;
     use x509_parser::prelude::FromDer;
+
+    fn fixture() -> (PathBuf, AcmeConfig, String, String) {
+        let dir = std::env::temp_dir().join(format!("elise-acme-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let config = AcmeConfig {
+            domain: "node.example.com".into(),
+            cert_mode: "http".into(),
+            cert_key_length: "ec-256".into(),
+            acme_server: "http://127.0.0.1:1/directory".into(),
+            acme_email: Some("admin@example.com".into()),
+            cert_file: dir.join("fullchain.pem"),
+            key_file: dir.join("privkey.pem"),
+        };
+        let mut params = CertificateParams::new(vec![config.domain.clone()]).unwrap();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        params.not_after = rcgen::date_time_ymd(1970, 1, 1) + now + Duration::from_secs(86400);
+        let key = KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap().pem();
+        (dir, config, cert, key.serialize_pem())
+    }
+
+    #[test]
+    fn certificate_pair_validation_and_private_staged_writes() {
+        let (dir, config, cert, key) = fixture();
+        validate_certificate_pair(&cert, &key, &config.domain).unwrap();
+        assert!(validate_certificate_pair(&cert, &key, "wrong.example.com").is_err());
+        assert!(validate_certificate_pair(
+            &cert,
+            &KeyPair::generate().unwrap().serialize_pem(),
+            &config.domain
+        )
+        .is_err());
+        save_certificate_pair(&config, &cert, &key).unwrap();
+        assert!(matches!(
+            check_acme_certificate(&config, 30),
+            CertStatus::NeedRenewal { .. }
+        ));
+        assert!(matches!(
+            check_acme_certificate(&config, 0),
+            CertStatus::Valid { .. }
+        ));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&config.key_file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        // A final rename failure must restore the old key and remove staging files.
+        let blocked_cert = dir.join("directory");
+        fs::create_dir(&blocked_cert).unwrap();
+        let blocked = AcmeConfig {
+            cert_file: blocked_cert,
+            ..config.clone()
+        };
+        assert!(save_certificate_pair(&blocked, &cert, "replacement").is_err());
+        assert_eq!(fs::read_to_string(&config.key_file).unwrap(), key);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 3);
+        fs::remove_file(&config.key_file).unwrap();
+        assert!(matches!(
+            check_acme_certificate(&config, 0),
+            CertStatus::Invalid(_)
+        ));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn renewal_failure_keeps_valid_pair_but_missing_pair_fails() {
+        let (dir, config, cert, key) = fixture();
+        save_certificate_pair(&config, &cert, &key).unwrap();
+        let mut node = NodeConfig {
+            cert_domain: Some(config.domain.clone()),
+            cert_file: Some(config.cert_file.clone()),
+            key_file: Some(config.key_file.clone()),
+            acme_server: Some(config.acme_server.clone()),
+            ..Default::default()
+        };
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            ensure_acme_certificate(&mut node, &NodeInfo::default()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(fs::read_to_string(&config.cert_file).unwrap(), cert);
+        assert_eq!(fs::read_to_string(&config.key_file).unwrap(), key);
+        fs::remove_file(&config.key_file).unwrap();
+        assert!(tokio::time::timeout(
+            Duration::from_secs(5),
+            ensure_acme_certificate(&mut node, &NodeInfo::default())
+        )
+        .await
+        .unwrap()
+        .is_err());
+        node.cert_domain = Some("../../bad.example.com".into());
+        assert!(ensure_acme_certificate(&mut node, &NodeInfo::default())
+            .await
+            .unwrap_err()
+            .contains("DNS hostname"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_challenge_serves_dual_stack_and_releases_port() {
+        let listener = bind_http_listener(0).unwrap();
+        let address = listener.local_addr().unwrap();
+        let responder = Http01ChallengeServer::serve(listener);
+        responder.add_token("fixture".into(), "fixture.authorization".into());
+        for host in if address.is_ipv6() {
+            vec!["127.0.0.1", "::1"]
+        } else {
+            vec!["127.0.0.1"]
+        } {
+            for (path, expected) in [("fixture", "200 OK"), ("unknown", "404 Not Found")] {
+                let mut stream = tokio::net::TcpStream::connect((host, address.port()))
+                    .await
+                    .unwrap();
+                stream.write_all(format!("GET /.well-known/acme-challenge/{path} HTTP/1.1\r\nHost: node.example.com\r\n\r\n").as_bytes()).await.unwrap();
+                let mut reply = String::new();
+                tokio::time::timeout(Duration::from_secs(2), stream.read_to_string(&mut reply))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(reply.contains(expected));
+                if path == "fixture" {
+                    assert!(reply.ends_with("fixture.authorization"));
+                }
+            }
+        }
+        responder.stop();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if bind_http_listener(address.port()).is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
 
     #[test]
     fn test_check_cert_validity_missing() {

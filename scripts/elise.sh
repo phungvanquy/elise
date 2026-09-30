@@ -29,6 +29,20 @@ ensure_python() {
     fi
     command -v python3 >/dev/null 2>&1 || die "python3 installation did not provide python3"
 }
+ensure_openssl() {
+    command -v openssl >/dev/null 2>&1 && return 0
+    echo "V2bX Elise: installing openssl" >&2
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y openssl || die "could not install openssl with apt-get"
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y openssl || die "could not install openssl with dnf"
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y openssl || die "could not install openssl with yum"
+    else
+        die "openssl is required and no supported package manager was found"
+    fi
+    command -v openssl >/dev/null 2>&1 || die "openssl installation did not provide openssl"
+}
 fetch() {
     curl --fail --location --silent --show-error --proto '=https' --proto-redir '=https' \
         --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 300 \
@@ -168,7 +182,7 @@ PY
         if [[ ! "$port" =~ ^[0-9]+$ || ! "$transport" =~ ^(tcp|udp)$ ]] ||
            ! systemctl restart "$(instance_unit "$instance")" ||
            ! systemctl is-active --quiet "$(instance_unit "$instance")" ||
-           ! wait_node_port "$listen" "$port" "$transport"; then
+           ! wait_node_port "$listen" "$port" "$transport" "$(startup_timeout "$(instance_dir "$instance")/elise.conf")"; then
             restore_release "$old_binary" "$old_unit" "$old_license"
             die "Elise failed to restart; previous binary and service restored"
         fi
@@ -312,8 +326,17 @@ print(transport)
 PY
 }
 
+startup_timeout() {
+    local mode
+    if [[ -f "$1" ]] && mode=$(sed -n 's/^cert_mode=//p' "$1") && [[ "$mode" == http || "$mode" == acme ]]; then
+        echo 300
+    else
+        echo 15
+    fi
+}
+
 wait_node_port() {
-    python3 - "$1" "$2" "${3:-tcp}" <<'PY'
+    python3 - "$1" "$2" "${3:-tcp}" "${4:-15}" <<'PY'
 import pathlib, socket, sys, time
 address, port = sys.argv[1], int(sys.argv[2])
 transport = sys.argv[3]
@@ -329,7 +352,8 @@ if transport == 'udp':
     packed = socket.inet_pton(family, address)
     encoded = ''.join(f'{int.from_bytes(packed[i:i+4], sys.byteorder):08X}' for i in range(0, len(packed), 4))
     udp_table = pathlib.Path('/proc/net/udp6' if family == socket.AF_INET6 else '/proc/net/udp')
-for _ in range(30):
+deadline = time.monotonic() + float(sys.argv[4])
+while time.monotonic() < deadline:
     try:
         if transport == 'udp':
             for line in udp_table.read_text().splitlines()[1:]:
@@ -347,11 +371,99 @@ sys.exit('Elise inbound did not open its panel port')
 PY
 }
 
+validate_tls_domain() {
+    python3 - "$1" <<'PY'
+import ipaddress, re, sys
+domain = sys.argv[1]
+try:
+    ipaddress.ip_address(domain)
+except ValueError:
+    if len(domain) <= 253 and '.' in domain and all(re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?', label) for label in domain.split('.')):
+        sys.exit(0)
+sys.exit('enter a DNS hostname, such as node.example.com (no URL, IP, or wildcard)')
+PY
+}
+
+http_tls_preflight() {
+    python3 - "$1" "$2" "$3" <<'PY'
+import socket, sys
+domain, port, transport = sys.argv[1:]
+if port == '80' and transport == 'tcp':
+    sys.exit('automatic HTTP TLS needs TCP port 80 for renewal; change the panel node port or use existing files')
+try:
+    socket.getaddrinfo(domain, 80, type=socket.SOCK_STREAM)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(('0.0.0.0', 80))
+    if socket.has_ipv6:
+        try:
+            with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as sock:
+                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                sock.bind(('::', 80))
+        except OSError as exc:
+            import errno
+            if exc.errno not in (errno.EAFNOSUPPORT, errno.EADDRNOTAVAIL):
+                raise
+except OSError as exc:
+    sys.exit(f'HTTP TLS preflight failed: {exc}; point DNS at this server and free TCP port 80, or use existing files')
+PY
+}
+
+configure_tls() {
+    local target=$1 port=$2 transport=$3 mode domain email cert_file key_file
+    cat <<'EOF'
+TLS certificate:
+  1) Existing certificate and private key files (default)
+  2) Automatic Let's Encrypt certificate (HTTP-01, with automatic renewal)
+  3) Generate a self-signed certificate (clients must trust it explicitly)
+EOF
+    read -rp 'Certificate mode [1]: ' mode
+    mode=${mode:-1}
+    case "$mode" in
+        1)
+            read -rp 'TLS certificate file (full chain): ' cert_file
+            read -rp 'TLS private key file: ' key_file
+            [[ "$cert_file" == /* && "$key_file" == /* && -s "$cert_file" && -s "$key_file" && "$cert_file$key_file" != *$'\r'* ]] || die "TLS certificate and key must be nonempty absolute files"
+            python3 - "$cert_file" "$key_file" <<'PY' || die "invalid TLS certificate or private key"
+import ssl, sys
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain(sys.argv[1], sys.argv[2], password='')
+PY
+            printf 'cert_mode=file\ncert_file=%s\nkey_file=%s\n' "$cert_file" "$key_file" >> "$work/elise.conf"
+            ;;
+        2|3)
+            read -rp 'TLS hostname (for example node.example.com): ' domain
+            validate_tls_domain "$domain" || die "invalid TLS hostname"
+            domain=${domain,,}
+            printf 'cert_domain=%s\ncert_file=%s/cert/fullchain.pem\nkey_file=%s/cert/privkey.pem\n' "$domain" "$target" "$target" >> "$work/elise.conf"
+            if [[ "$mode" == 2 ]]; then
+                echo "Point the domain's A/AAAA records at this server and allow inbound TCP port 80. Keep port 80 available for renewal."
+                echo "This mode registers an account under the Let's Encrypt subscriber agreement: https://letsencrypt.org/repository/"
+                read -rp "Let's Encrypt account email: " email
+                [[ "$email" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ && "$email" != *'#'* ]] || die "invalid account email"
+                http_tls_preflight "$domain" "$port" "$transport" || die "automatic TLS preflight failed"
+                printf 'cert_mode=http\ncert_key_length=ec-256\nacme_server=letsencrypt\nacme_email=%s\n' "$email" >> "$work/elise.conf"
+                echo "Initial certificate issuance may take a few minutes."
+            else
+                ensure_openssl
+                mkdir -m 0700 "$work/cert"
+                (umask 077; openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 365 \
+                    -subj "/CN=$domain" -addext "subjectAltName=DNS:$domain" \
+                    -addext 'basicConstraints=critical,CA:FALSE' -addext 'keyUsage=critical,digitalSignature,keyEncipherment' \
+                    -addext 'extendedKeyUsage=serverAuth' \
+                    -keyout "$work/cert/privkey.pem" -out "$work/cert/fullchain.pem" 2>"$work/openssl.log") || die "could not generate self-signed certificate"
+                printf 'cert_mode=file\n' >> "$work/elise.conf"
+            fi
+            ;;
+        *) die "certificate mode must be 1, 2, or 3" ;;
+    esac
+    tls_choice=$mode
+}
+
 add_node() {
     need_root; need_systemd
     [[ -x "$binary" ]] || die "install the Elise binary first"
     ensure_python
-    local kind=${1:-} node_id=${2:-} instance target panel_url panel_key listen cert_file key_file security port transport preflight
+    local kind=${1:-} node_id=${2:-} instance target panel_url panel_key listen security port transport preflight tls_choice=""
     local -a details
     kind=$(normalize_kind "$kind") || die "type must be vless, vmess, anytls, hysteria (hysteria1/hy1), or hysteria2 (hy2)"
     [[ "$node_id" =~ ^[1-9][0-9]*$ ]] || die "node ID must be a positive integer"
@@ -397,14 +509,15 @@ EOF
     port=${details[0]:-}; security=${details[1]:-}; transport=${details[2]:-}
     [[ "$port" =~ ^[0-9]+$ && "$security" =~ ^[0-2]$ && "$transport" =~ ^(tcp|udp)$ ]] || die "panel preflight failed"
     if [[ "$security" == 1 ]]; then
-        read -rp 'TLS certificate file (full chain): ' cert_file
-        read -rp 'TLS private key file: ' key_file
-        [[ "$cert_file" == /* && "$key_file" == /* && -s "$cert_file" && -s "$key_file" ]] || die "TLS certificate and key must be nonempty absolute files"
-        printf 'cert_file=%s\nkey_file=%s\n' "$cert_file" "$key_file" >> "$work/elise.conf"
+        configure_tls "$target" "$port" "$transport"
     fi
     mkdir -p "$target/nodes"
     chmod 0700 "$config_dir" "$target" "$target/nodes"
     install -m 0600 "$work/elise.conf" "$target/elise.conf"
+    if [[ -d "$work/cert" ]]; then
+        mkdir -m 0700 "$target/cert"
+        install -m 0600 "$work/cert/fullchain.pem" "$work/cert/privkey.pem" "$target/cert/"
+    fi
     local name
     for name in routes.toml dns.yml blockList whiteList; do
         : > "$target/$name"
@@ -412,15 +525,20 @@ EOF
     done
     if ! systemctl enable --now "$(instance_unit "$instance")" ||
        ! systemctl is-active --quiet "$(instance_unit "$instance")" ||
-       ! wait_node_port "$listen" "$port" "$transport"; then
+       ! wait_node_port "$listen" "$port" "$transport" "$(startup_timeout "$target/elise.conf")"; then
         systemctl disable --now "$(instance_unit "$instance")" >/dev/null 2>&1 || true
-        rm -rf -- "$target"
-        die "Elise service failed; inspect journalctl -u $(instance_unit "$instance")"
+        die "Elise service failed; configuration and certificates retained at $target. Inspect journalctl -u $(instance_unit "$instance"), fix the issue, then run: systemctl enable --now $(instance_unit "$instance")"
     fi
     echo "Elise $instance started on $listen:$port ($transport)"
-    if [[ "$security" == 1 ]]; then
-        echo "Configure your certificate renewal tool to run: V2bX elise restart $instance"
-    fi
+    case "$tls_choice" in
+        1) echo "Configure your certificate renewal tool to run: V2bX elise restart $instance" ;;
+        2) echo "Elise renews this certificate automatically and reloads the listener after renewal." ;;
+        3)
+            echo "Self-signed certificate saved at $target/cert/fullchain.pem (valid for 365 days)."
+            echo "Trust this certificate explicitly in your client and set the TLS server name to the configured hostname. Replace it before expiry."
+            openssl x509 -in "$target/cert/fullchain.pem" -noout -fingerprint -sha256
+            ;;
+    esac
 }
 
 service_action() {
