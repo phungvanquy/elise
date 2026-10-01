@@ -293,12 +293,15 @@ impl GlobalConfig {
         }
         if let Some(node_type) = cfg.panel_node_type.as_deref() {
             if cfg.panel_type != "xboard"
-                || !matches!(node_type, "vless" | "vmess")
+                || !matches!(
+                    node_type,
+                    "vless" | "vmess" | "anytls" | "hysteria" | "hysteria2"
+                )
                 || cfg.node_ids.len() != 1
             {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "panel_node_type requires type=xboard, one node_id, and vless or vmess",
+                    "panel_node_type requires type=xboard, one node_id, and vless, vmess, anytls, hysteria, or hysteria2",
                 ));
             }
         }
@@ -874,4 +877,53 @@ fn parse_port_ranges(val: &str) -> Vec<(u16, u16)> {
         }
     }
     ranges
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn load_config(content: &str) -> std::io::Result<GlobalConfig> {
+        let path =
+            std::env::temp_dir().join(format!("elise-global-config-{}.conf", uuid::Uuid::new_v4()));
+        fs::write(&path, content).unwrap();
+        let result = GlobalConfig::load_from_file(&path);
+        fs::remove_file(path).unwrap();
+        result
+    }
+
+    #[test]
+    fn installer_panel_node_types_load_from_file() {
+        for kind in ["vless", "vmess", "anytls", "hysteria", "hysteria2"] {
+            let config = load_config(&format!(
+                "type=xboard\npanel_url=https://panel.example.com\npanel_key=fixture\n\
+                 panel_node_type={kind}\nnode_id=70\nlisten=0.0.0.0\n\
+                 pprof_addr=off\nauto_tls=false\n"
+            ))
+            .unwrap_or_else(|error| panic!("installer configuration for {kind}: {error}"));
+            assert_eq!(config.panel_node_type.as_deref(), Some(kind));
+            assert_eq!(config.node_ids, vec![70]);
+        }
+    }
+
+    #[test]
+    fn panel_node_type_requires_xboard_and_a_single_node() {
+        for kind in ["vless", "vmess", "anytls", "hysteria", "hysteria2"] {
+            for (panel, ids) in [("v2board", "70"), ("xboard", "70,71")] {
+                let error = load_config(&format!(
+                    "type={panel}\npanel_node_type={kind}\nnode_id={ids}\n"
+                ))
+                .unwrap_err();
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+                assert!(error.to_string().contains("panel_node_type requires"));
+            }
+        }
+    }
+
+    #[test]
+    fn panel_node_type_rejects_unknown_protocols() {
+        let error = load_config("type=xboard\npanel_node_type=unknown\nnode_id=70\n").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("panel_node_type requires"));
+    }
 }
