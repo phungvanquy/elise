@@ -56,6 +56,14 @@ normalize_kind() {
         *) return 1 ;;
     esac
 }
+normalize_panel() {
+    case "${1,,}" in
+        xboard|v2board|xiaov2board|ppanel|sspanel) printf '%s\n' "${1,,}" ;;
+        xiaov2b) echo xiaov2board ;;
+        sspanel-uim) echo sspanel ;;
+        *) return 1 ;;
+    esac
+}
 valid_instance() { [[ "${1:-}" =~ ^(vless|vmess|anytls|hysteria|hysteria2)-[1-9][0-9]*$ ]]; }
 instance_dir() { printf '%s/%s' "$config_dir" "$1"; }
 instance_unit() { printf 'V2bX-elise@%s.service' "$1"; }
@@ -267,23 +275,38 @@ PY
 }
 
 panel_port_and_security() {
-    python3 - "$1" "${2:-}" <<'PY'
-import pathlib, socket, sys, urllib.parse, urllib.request, json
+    python3 - "$1" "${2:-}" "$binary" <<'PY'
+import pathlib, socket, subprocess, sys, urllib.parse, urllib.request, json
 values = {}
 for line in pathlib.Path(sys.argv[1]).read_text().splitlines():
     if '=' in line:
         key, value = line.split('=', 1)
         values[key.strip()] = value.strip()
 kind = values['panel_node_type']
-query = urllib.parse.urlencode({'node_type': kind, 'node_id': values['node_id'], 'token': values['panel_key']})
-url = values['panel_url'].rstrip('/') + '/api/v1/server/UniProxy/config?' + query
-try:
-    request = urllib.request.Request(url, headers={'User-Agent': 'V2bX-Elise/1.0'})
-    with urllib.request.urlopen(request, timeout=15) as response:
-        payload = json.load(response)
-except Exception as exc:
-    sys.exit(f'cannot fetch panel node configuration: {exc}')
-data = payload.get('data', payload)
+panel_type = values.get('type', 'xboard')
+if panel_type == 'xboard':
+    # Keep XBoard installation compatible with earlier Elise binaries.
+    query = urllib.parse.urlencode({'node_type': kind, 'node_id': values['node_id'], 'token': values['panel_key']})
+    url = values['panel_url'].rstrip('/') + '/api/v1/server/UniProxy/config?' + query
+    try:
+        request = urllib.request.Request(url, headers={'User-Agent': 'V2bX-Elise/1.0'})
+        with urllib.request.urlopen(request, timeout=15) as response:
+            payload = json.load(response)
+        data = payload.get('data', payload)
+    except Exception as exc:
+        sys.exit(f'cannot fetch panel node configuration: {exc}')
+else:
+    # Use the same API adapters and protocol selection as the running core.
+    try:
+        result = subprocess.run([sys.argv[3], 'panel-info', '--config', sys.argv[1]],
+                                capture_output=True, text=True, timeout=60)
+        if result.returncode:
+            if 'unrecognized subcommand' in result.stderr or 'requires type=xboard' in result.stderr:
+                sys.exit('this panel requires Elise from V2bX v0.6.4 or newer; update the core first')
+            sys.exit(f'cannot fetch {panel_type} node configuration: {result.stderr.strip()}')
+        data = json.loads(result.stdout)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        sys.exit(f'cannot inspect {panel_type} node configuration: {exc}')
 reported = data.get('server_type') or data.get('protocol') or data.get('node_type') or data.get('type')
 def protocol(name):
     name = name.lower()
@@ -308,7 +331,7 @@ if kind == 'vless' and security not in (0, 1, 2):
     sys.exit('unsupported VLESS security mode')
 if security == 2:
     tls = data.get('tls_settings') or data.get('tlsSettings') or {}
-    if not (tls.get('private_key') and (tls.get('public_key') or data.get('public_key'))):
+    if not (data.get('reality_keys_present') or (tls.get('private_key') and (tls.get('public_key') or data.get('public_key')))):
         sys.exit('REALITY requires matching private and public keys in the panel')
 transport = 'udp' if kind in ('hysteria', 'hysteria2') else 'tcp'
 if sys.argv[2] != 'no-bind':
@@ -463,9 +486,10 @@ add_node() {
     need_root; need_systemd
     [[ -x "$binary" ]] || die "install the Elise binary first"
     ensure_python
-    local kind=${1:-} node_id=${2:-} instance target panel_url panel_key listen security port transport preflight tls_choice=""
+    local kind=${1:-} node_id=${2:-} panel_type=${3:-xboard} instance target panel_url panel_key listen security port transport preflight tls_choice=""
     local -a details
     kind=$(normalize_kind "$kind") || die "type must be vless, vmess, anytls, hysteria (hysteria1/hy1), or hysteria2 (hy2)"
+    panel_type=$(normalize_panel "$panel_type") || die "panel must be xboard, v2board, xiaov2board, ppanel, or sspanel"
     [[ "$node_id" =~ ^[1-9][0-9]*$ ]] || die "node ID must be a positive integer"
     python3 - "$node_id" <<'PY' || die "node ID exceeds Elise's u32 range"
 import sys
@@ -487,7 +511,7 @@ PY
     [[ "$listen" =~ ^[0-9a-fA-F:.]+$ ]] || die "listen address must be an IP address"
     work=$(mktemp -d /tmp/v2bx-elise.XXXXXX)
     cat > "$work/elise.conf" <<EOF
-type=xboard
+type=$panel_type
 panel_url=$panel_url
 panel_key=$panel_key
 panel_node_type=$kind
@@ -583,19 +607,21 @@ uninstall_all() {
 usage() {
     cat <<'EOF'
 Usage: V2bX elise install [V2bX release version]
-       V2bX elise add <vless|vmess|anytls|hysteria|hysteria2> <node-id>
+       V2bX elise add <vless|vmess|anytls|hysteria|hysteria2> <node-id> [panel]
        V2bX elise list
        V2bX elise start|stop|restart|status|log <protocol-id>
        V2bX elise remove <protocol-id>
        V2bX elise uninstall
 
 Hysteria aliases: hysteria1/hy1 -> hysteria; hy2 -> hysteria2.
+Panels: xboard (default), v2board, xiaov2board (xiaov2b), ppanel, sspanel (sspanel-uim).
+Panels other than XBoard require an Elise binary from V2bX v0.6.4 or newer.
 EOF
 }
 
 case "${1:-}" in
     install|update) shift; install_binary "${1:-}" ;;
-    add) shift; add_node "${1:-}" "${2:-}" ;;
+    add) shift; add_node "${1:-}" "${2:-}" "${3:-xboard}" ;;
     list) need_root; installed_instances ;;
     start|stop|restart|status|log) action=$1; shift; service_action "$action" "${1:-}" ;;
     remove) shift; remove_node "${1:-}" ;;

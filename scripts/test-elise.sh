@@ -222,6 +222,52 @@ systemctl() {
             server.node_listener.close()
             server.node_listener = None
 
+        # Other platforms must use the Rust adapter rather than the XBoard URL.
+        # The Rust integration tests exercise these adapters against real HTTP fixtures.
+        panel_binary = Path(root) / 'panel-info-core'
+        panel_binary.write_text('''#!/usr/bin/env python3
+import json, os, pathlib, sys
+assert sys.argv[1:3] == ['panel-info', '--config'], sys.argv
+values = dict(line.split('=', 1) for line in pathlib.Path(sys.argv[3]).read_text().splitlines() if '=' in line)
+assert values['type'] == os.environ['ELISE_TEST_PANEL']
+assert values['panel_node_type'] == 'anytls'
+assert values['panel_key'] == 'key+value'
+print(os.environ['ELISE_TEST_NODE_INFO'])
+''')
+        panel_binary.chmod(0o755)
+        native_setup = service_setup + 'binary=$2; '
+        for requested, platform in [('v2board', 'v2board'), ('xiaov2board', 'xiaov2board'),
+                                    ('xiaov2b', 'xiaov2board'), ('ppanel', 'ppanel'),
+                                    ('sspanel', 'sspanel'), ('sspanel-uim', 'sspanel')]:
+            with socket.socket() as sock:
+                sock.bind(('127.0.0.1', 0))
+                server.node_port = sock.getsockname()[1]
+            server.node_transport = socket.SOCK_STREAM
+            env['ELISE_TEST_PANEL'] = platform
+            env['ELISE_TEST_NODE_INFO'] = json.dumps({'server_type': 'anytls', 'server_port': server.node_port, 'tls': 1})
+            result = run_helper(
+                native_setup + 'add_node anytls 9 "$1"', config_root, requested, panel_binary,
+                input=f'http://127.0.0.1:{server.server_port}\nkey+value\n127.0.0.1\n1\n{cert}\n{key}\n', check=True,
+            )
+            config = config_root / 'anytls-9/elise.conf'
+            assert f'type={platform}\n' in config.read_text()
+            assert 'panel_node_type=anytls\n' in config.read_text()
+            run_helper(service_setup + 'remove_node anytls-9', config_root, check=True)
+            server.node_listener.close()
+            server.node_listener = None
+
+        result = run_helper(service_setup + 'add_node anytls 9 unknown', config_root)
+        assert result.returncode != 0 and 'panel must be' in result.stderr
+        env['ELISE_TEST_NODE_INFO'] = json.dumps({'server_type': 'vmess', 'server_port': server.node_port, 'tls': 1})
+        result = run_helper(native_setup + 'add_node anytls 9 "$1"', config_root, 'sspanel', panel_binary,
+                            input=f'http://127.0.0.1:{server.server_port}\nkey+value\n127.0.0.1\n')
+        assert result.returncode != 0 and 'expected anytls' in result.stderr
+        assert not (config_root / 'anytls-9').exists()
+        panel_binary.write_text("#!/bin/sh\necho 'error: unrecognized subcommand panel-info' >&2\nexit 2\n")
+        result = run_helper(native_setup + 'add_node anytls 9 "$1"', config_root, 'sspanel', panel_binary,
+                            input=f'http://127.0.0.1:{server.server_port}\nkey+value\n127.0.0.1\n')
+        assert result.returncode != 0 and 'update the core first' in result.stderr
+
         for domain in ('*.example.com', 'https://node.example.com', '../bad', '127.0.0.1', 'node', '-bad.example.com', 'bad#.example.com'):
             assert run_helper('validate_tls_domain "$1"', domain).returncode != 0, domain
         run_helper('validate_tls_domain node.example.com', check=True)

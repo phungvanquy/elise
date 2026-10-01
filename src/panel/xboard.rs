@@ -6,7 +6,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-fn resolve_node_type(name: &str, version: Option<u32>) -> String {
+pub(super) fn resolve_node_type(name: &str, version: Option<u32>) -> String {
     let name = name.to_ascii_lowercase();
     match name.as_str() {
         "v2ray" => "vmess".into(),

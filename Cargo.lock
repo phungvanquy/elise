@@ -895,6 +895,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "url",
  "uuid",
  "x25519-dalek",
  "x509-parser",

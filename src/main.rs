@@ -10,7 +10,7 @@ use std::path::PathBuf;
 #[command(
     name = "elise",
     version,
-    about = "Elise - 专为 Xboard 设计的高性能全协议原生节点后端 (100% Native Rust)"
+    about = "Elise - Native Rust node backend for XBoard, V2Board, XiaoV2Board, PPanel, and SSPanel"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -25,6 +25,12 @@ enum Commands {
     Run(RunArgs),
 
     Start(RunArgs),
+
+    /// Fetch normalized node settings using the configured panel client.
+    PanelInfo {
+        #[arg(short, long)]
+        config: PathBuf,
+    },
 
     Config {
         #[arg(
@@ -158,6 +164,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let server = MasterServer::new(cfg);
             server.run().await?;
         }
+        Some(Commands::PanelInfo { config }) => {
+            let cfg = GlobalConfig::load_from_file(config)?;
+            if cfg.node_ids.len() != 1 {
+                return Err("panel-info requires one node_id".into());
+            }
+            let client = elise::panel::create_panel_client_with_node_type(
+                &cfg.panel_type,
+                &cfg.api_host,
+                &cfg.api_key,
+                cfg.panel_node_type.as_deref(),
+            );
+            let info = client
+                .get_node_info(cfg.node_ids[0])
+                .await
+                .map_err(|error| match error.downcast::<reqwest::Error>() {
+                    Ok(http) => std::io::Error::other(http.without_url()),
+                    Err(other) => std::io::Error::other(other),
+                })?;
+            let tls = info.tls_settings.as_ref();
+            let has_private = tls
+                .and_then(|v| v.get("private_key"))
+                .and_then(|v| v.as_str())
+                .is_some_and(|v| !v.is_empty());
+            let has_public = tls
+                .and_then(|v| v.get("public_key"))
+                .and_then(|v| v.as_str())
+                .or(info.public_key.as_deref())
+                .is_some_and(|v| !v.is_empty());
+            // The installer only needs these fields; never print panel credentials or TLS keys.
+            println!(
+                "{}",
+                serde_json::json!({
+                    "server_type": info.node_type, "server_port": info.server_port,
+                    "tls": info.tls, "version": info.version,
+                    "reality_keys_present": has_private && has_public,
+                })
+            );
+        }
         Some(Commands::Config { args }) => {
             handle_config_command(cli.config, args);
         }
@@ -225,7 +269,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
         Some(Commands::Version) => {
             println!(
-                "Elise 原生核心 v{}\n专为 Xboard 设计的高性能全协议原生节点后端 (100% Native Rust)",
+                "Elise v{}\nNative Rust node backend for XBoard, V2Board, XiaoV2Board, PPanel, and SSPanel",
                 elise::VERSION
             );
         }

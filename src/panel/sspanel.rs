@@ -16,7 +16,7 @@ impl SSPanelClient {
                 .build()
                 .unwrap_or_default(),
             base_url: base_url.trim_end_matches('/').to_string(),
-            key,
+            key: super::encode_query_key(&key),
         }
     }
 
@@ -28,7 +28,7 @@ impl SSPanelClient {
             "{}/mod_mu/nodes/{}/info?key={}",
             self.base_url, node_id, self.key
         );
-        let resp = self.client.get(&url).send().await?;
+        let resp = self.client.get(&url).send().await?.error_for_status()?;
         let val: Value = resp.json().await?;
         let data = val.get("data").unwrap_or(&val);
 
@@ -69,8 +69,14 @@ impl SSPanelClient {
                 .and_then(|v| v.as_str())
                 .map(String::from),
             plugin_opts: data.get("plugin_opts").cloned(),
-            up_mbps: None,
-            down_mbps: None,
+            up_mbps: data
+                .get("up_mbps")
+                .and_then(Value::as_u64)
+                .map(|v| v as u32),
+            down_mbps: data
+                .get("down_mbps")
+                .and_then(Value::as_u64)
+                .map(|v| v as u32),
             server_key: if is_ssr {
                 data.get("password")
                     .or_else(|| data.get("passwd"))
@@ -79,14 +85,37 @@ impl SSPanelClient {
             } else {
                 None
             },
-            network_settings: if is_ssr { Some(data.clone()) } else { None },
+            network_settings: if is_ssr {
+                Some(data.clone())
+            } else {
+                data.get("network_settings")
+                    .or_else(|| data.get("networkSettings"))
+                    .cloned()
+            },
             obfs: if is_ssr {
                 data.get("obfs").and_then(Value::as_str).map(String::from)
             } else {
                 None
             },
             short_ids: None,
-            public_key: None,
+            public_key: data
+                .get("public_key")
+                .and_then(Value::as_str)
+                .map(String::from),
+            tls_settings: data
+                .get("tls_settings")
+                .or_else(|| data.get("tlsSettings"))
+                .cloned(),
+            version: data
+                .get("version")
+                .and_then(Value::as_u64)
+                .map(|v| v as u32),
+            obfs_password: data
+                .get("obfs_password")
+                .or_else(|| data.get("obfs-password"))
+                .and_then(Value::as_str)
+                .map(String::from),
+            padding_scheme: data.get("padding_scheme").cloned(),
             ..Default::default()
         })
     }

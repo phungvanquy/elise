@@ -15,6 +15,12 @@ pub use xiaov2board::XiaoV2BoardClient;
 use async_trait::async_trait;
 use std::sync::Arc;
 
+// These legacy adapters interpolate credentials into their query strings.
+// Encode once so reserved characters survive every config, user, and report request.
+pub(super) fn encode_query_key(key: &str) -> String {
+    url::form_urlencoded::byte_serialize(key.as_bytes()).collect()
+}
+
 #[async_trait]
 pub trait PanelClient: Send + Sync {
     async fn get_node_info(
@@ -245,18 +251,89 @@ pub fn create_panel_client_with_node_type(
     key: &str,
     node_type: Option<&str>,
 ) -> Arc<dyn PanelClient> {
-    match panel_type.to_lowercase().as_str() {
+    let client: Arc<dyn PanelClient> = match panel_type.to_lowercase().as_str() {
         "v2board" => Arc::new(V2BoardClient::new(url.to_string(), key.to_string())),
         "xiaov2board" | "xiaov2b" => {
             Arc::new(XiaoV2BoardClient::new(url.to_string(), key.to_string()))
         }
-        "ppanel" => Arc::new(PPanelClient::new(url.to_string(), key.to_string())),
+        "ppanel" => Arc::new(PPanelClient::new_with_node_type(
+            url.to_string(),
+            key.to_string(),
+            node_type.map(str::to_string),
+        )),
         "sspanel" | "sspanel-uim" => Arc::new(SSPanelClient::new(url.to_string(), key.to_string())),
         _ => Arc::new(XboardClient::new_with_node_type(
             url.to_string(),
             key.to_string(),
             node_type.map(str::to_string),
         )),
+    };
+    if let Some(expected) = node_type {
+        Arc::new(TypedPanelClient {
+            inner: client,
+            expected: expected.to_string(),
+        })
+    } else {
+        client
+    }
+}
+
+struct TypedPanelClient {
+    inner: Arc<dyn PanelClient>,
+    expected: String,
+}
+
+#[async_trait]
+impl PanelClient for TypedPanelClient {
+    async fn get_node_info(
+        &self,
+        node_id: u32,
+    ) -> Result<NodeInfo, Box<dyn std::error::Error + Send + Sync>> {
+        let mut info = self.inner.get_node_info(node_id).await?;
+        let expected = xboard::resolve_node_type(&self.expected, info.version);
+        let actual = xboard::resolve_node_type(&info.node_type, info.version);
+        if actual != expected {
+            return Err(format!(
+                "Panel node type {} does not match configured {}",
+                info.node_type, self.expected
+            )
+            .into());
+        }
+        info.node_type = actual;
+        Ok(info)
+    }
+    async fn get_users(
+        &self,
+        node_id: u32,
+    ) -> Result<Vec<User>, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.get_users(node_id).await
+    }
+    async fn report_traffic(
+        &self,
+        node_id: u32,
+        traffic: Vec<TrafficItem>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.report_traffic(node_id, traffic).await
+    }
+    async fn report_online_devices(
+        &self,
+        node_id: u32,
+        devices: Vec<OnlineDeviceItem>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.report_online_devices(node_id, devices).await
+    }
+    async fn get_user_alivelist(
+        &self,
+        node_id: u32,
+    ) -> Result<std::collections::HashMap<u32, u32>, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.get_user_alivelist(node_id).await
+    }
+    async fn report_node_status(
+        &self,
+        node_id: u32,
+        status: &NodeStatusReport,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.report_node_status(node_id, status).await
     }
 }
 

@@ -10,18 +10,24 @@ pub struct PPanelClient {
     client: Client,
     base_url: String,
     key: String,
+    node_type: Option<String>,
     cached_users: RwLock<HashMap<u32, Arc<tokio::sync::Mutex<(Option<String>, Vec<User>)>>>>,
 }
 
 impl PPanelClient {
     pub fn new(base_url: String, key: String) -> Self {
+        Self::new_with_node_type(base_url, key, None)
+    }
+
+    pub fn new_with_node_type(base_url: String, key: String, node_type: Option<String>) -> Self {
         Self {
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
                 .unwrap_or_default(),
             base_url: base_url.trim_end_matches('/').to_string(),
-            key,
+            key: super::encode_query_key(&key),
+            node_type,
             cached_users: RwLock::new(HashMap::new()),
         }
     }
@@ -51,8 +57,23 @@ impl PPanelClient {
                                     .and_then(|e| e.as_bool())
                                     .unwrap_or(true);
                                 if enabled {
-                                    return Ok(self.parse_v2_protocol(node_id, proto, data));
+                                    let info = self.parse_v2_protocol(node_id, proto, data);
+                                    if self.node_type.as_deref().is_none_or(|expected| {
+                                        super::xboard::resolve_node_type(expected, info.version)
+                                            == super::xboard::resolve_node_type(
+                                                &info.node_type,
+                                                info.version,
+                                            )
+                                    }) {
+                                        return Ok(info);
+                                    }
                                 }
+                            }
+                            if let Some(expected) = self.node_type.as_deref() {
+                                return Err(format!(
+                                    "PPanel has no enabled {expected} protocol for node {node_id}"
+                                )
+                                .into());
                             }
                             if let Some(first) = protocols.first() {
                                 return Ok(self.parse_v2_protocol(node_id, first, data));
@@ -185,6 +206,10 @@ impl PPanelClient {
         NodeInfo {
             id: node_id,
             node_type,
+            version: proto
+                .get("version")
+                .and_then(Value::as_u64)
+                .map(|v| v as u32),
             server_port: proto.get("port").and_then(|v| v.as_u64()).unwrap_or(443) as u16,
             host: proto.get("host").and_then(|v| v.as_str()).map(String::from),
             path: proto.get("path").and_then(|v| v.as_str()).map(String::from),
