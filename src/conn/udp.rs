@@ -36,23 +36,29 @@ impl UdpSession {
         protocol: &'static str,
     ) -> io::Result<Self> {
         let ip = host.parse().ok();
-        if ctx.audit.should_block(&host, ip, port)
-            || !ctx
-                .device_limiter
-                .check_and_record_async(user_id, remote.ip())
-                .await
-        {
+        if ctx.audit.should_block(&host, ip, port) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "UDP audit/device limit rejected",
+                "UDP audit rejected",
             ));
         }
-        let guard = ctx.conn_limiter.try_acquire(user_id).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "UDP connection limit reached",
-            )
-        })?;
+        let device_guard = ctx
+            .device_limiter
+            .try_acquire_async(user_id, remote.ip())
+            .await
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::PermissionDenied, "UDP device limit rejected")
+            })?;
+        let guard = ctx
+            .conn_limiter
+            .try_acquire(user_id)
+            .map(|guard| guard.with_device(device_guard))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "UDP connection limit reached",
+                )
+            })?;
         let outbound = ctx.router.match_outbound(&MatchContext {
             node_id: ctx.node_id,
             network: "udp",

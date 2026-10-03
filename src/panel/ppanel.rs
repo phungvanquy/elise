@@ -503,7 +503,12 @@ impl PPanelClient {
                     "{}/api/v1/server/nodes/{}/online?token={}",
                     self.base_url, node_id, self.key
                 );
-                let _ = self.client.post(&fallback_url).json(&payload).send().await;
+                self.client
+                    .post(&fallback_url)
+                    .json(&payload)
+                    .send()
+                    .await?
+                    .error_for_status()?;
             }
         }
         Ok(())

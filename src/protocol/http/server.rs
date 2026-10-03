@@ -248,22 +248,26 @@ async fn handle_http_connection(
         conn_id, remote_addr, user.id, method, target
     );
 
-    if !ctx
+    let Some(device_guard) = ctx
         .device_limiter
-        .check_and_record_async(user.id, remote_addr.ip())
+        .try_acquire_async(user.id, remote_addr.ip())
         .await
-    {
+    else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "Device limit exceeded",
         ));
-    }
-    let _conn_guard = ctx.conn_limiter.try_acquire(user.id).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "Connection limit exceeded",
-        )
-    })?;
+    };
+    let _conn_guard = ctx
+        .conn_limiter
+        .try_acquire(user.id)
+        .map(|guard| guard.with_device(device_guard))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Connection limit exceeded",
+            )
+        })?;
 
     if method.eq_ignore_ascii_case("CONNECT") {
         match handle_connect(stream, target, leftover, &user, remote_addr, &ctx).await {

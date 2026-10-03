@@ -366,6 +366,8 @@ async fn handle_hy2_connection(
 
     let auth_done = Arc::new(Notify::new());
     let auth_ok = Arc::new(AtomicBool::new(false));
+    // Reauthentication must not release a user whose child streams still run.
+    let mut device_guards = HashMap::new();
     let authenticated_user: Arc<Mutex<Option<User>>> = Arc::new(Mutex::new(None));
 
     let udp_sessions: Arc<Mutex<HashMap<u32, mpsc::Sender<(String, Vec<u8>)>>>> =
@@ -603,10 +605,11 @@ async fn handle_hy2_connection(
                             }
                         };
 
-                        if !ctx.device_limiter.check_and_record_async(user.id, client_ip).await {
+                        let Some(guard) = ctx.device_limiter.try_acquire_async(user.id, client_ip).await else {
                             conn.close(1u32.into(), b"device limit exceeded");
                             continue;
-                        }
+                        };
+                        device_guards.insert(user.id, guard);
 
                         *authenticated_user.lock() = Some(user);
                         auth_ok.store(true, Ordering::Release);
@@ -635,6 +638,7 @@ async fn handle_hy2_connection(
     conn_cancel.cancel();
     conn.close(0u32.into(), b"session closed");
     crate::protocol::common::inbound::drain_connections(&mut tasks).await;
+    drop(device_guards);
     result
 }
 

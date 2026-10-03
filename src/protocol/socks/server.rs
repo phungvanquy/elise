@@ -42,11 +42,11 @@ pub async fn handle_connection(
 
         let authenticated_user = negotiate_auth(&mut stream, client_ip, users, &ctx).await?;
 
-        if !ctx
+        let Some(device_guard) = ctx
             .device_limiter
-            .check_and_record_async(authenticated_user.id, client_ip)
+            .try_acquire_async(authenticated_user.id, client_ip)
             .await
-        {
+        else {
             let _ = stream
                 .write_all(&[0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
                 .await;
@@ -54,10 +54,10 @@ pub async fn handle_connection(
                 io::ErrorKind::PermissionDenied,
                 "SOCKS5 device limit reached",
             ));
-        }
+        };
 
         let conn_guard = match ctx.conn_limiter.try_acquire(authenticated_user.id) {
-            Some(g) => g,
+            Some(g) => g.with_device(device_guard),
             None => {
                 let _ = stream
                     .write_all(&[0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0])

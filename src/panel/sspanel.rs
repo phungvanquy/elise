@@ -193,7 +193,12 @@ impl SSPanelClient {
             "{}/mod_mu/users/aliveip?node_id={}&key={}",
             self.base_url, node_id, self.key
         );
-        let _ = self.client.post(&url).json(&devices).send().await;
+        self.client
+            .post(&url)
+            .json(&devices)
+            .send()
+            .await?
+            .error_for_status()?;
         Ok(())
     }
 }

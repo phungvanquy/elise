@@ -36,6 +36,7 @@ pub struct NodeRunner {
     pub ip_user_cache: Arc<IpUserCache>,
     traffic_buffer: Arc<Mutex<HashMap<u32, (u64, u64)>>>,
     report_lock: tokio::sync::Mutex<()>,
+    reported_online: Mutex<HashMap<u32, Vec<String>>>,
     traffic_path: std::path::PathBuf,
     traffic_file_lock: Mutex<Option<Arc<std::fs::File>>>,
     traffic_io_lock: Arc<Mutex<()>>,
@@ -122,6 +123,7 @@ impl NodeRunner {
             ip_user_cache,
             traffic_buffer: Arc::new(Mutex::new(HashMap::new())),
             report_lock: tokio::sync::Mutex::new(()),
+            reported_online: Mutex::new(HashMap::new()),
             traffic_path,
             traffic_file_lock: Mutex::new(None),
             traffic_io_lock: Arc::new(Mutex::new(())),
@@ -921,23 +923,48 @@ impl NodeRunner {
         }
 
         let online_map = self.device_limiter.get_all_online_devices();
-        if !online_map.is_empty() {
-            let dev_items: Vec<OnlineDeviceItem> = online_map
-                .into_iter()
-                .filter(|(user_id, _)| {
-                    if min_alive_bytes == 0 {
-                        true
-                    } else {
-                        active_users.get(user_id).copied().unwrap_or(0) >= min_alive_bytes
-                    }
+        let mut report: HashMap<u32, Vec<String>> = online_map
+            .iter()
+            .filter(|(user_id, _)| {
+                min_alive_bytes == 0
+                    || active_users.get(user_id).copied().unwrap_or(0) >= min_alive_bytes
+            })
+            .map(|(&user_id, ips)| (user_id, ips.clone()))
+            .collect();
+        // A missing user leaves the panel's previous IPs alive until its TTL.
+        // Explicitly clear users whose last session closed, retrying on failure.
+        for &user_id in self.reported_online.lock().keys() {
+            if !online_map.contains_key(&user_id) {
+                report.insert(user_id, Vec::new());
+            }
+        }
+        if !report.is_empty() {
+            let items = report
+                .iter()
+                .map(|(&user_id, ips)| OnlineDeviceItem {
+                    user_id,
+                    ips: ips.clone(),
                 })
-                .map(|(user_id, ips)| OnlineDeviceItem { user_id, ips })
                 .collect();
-            if !dev_items.is_empty() {
-                let _ = self
-                    .panel_client
-                    .report_online_devices(self.node_id, dev_items)
-                    .await;
+            match self
+                .panel_client
+                .report_online_devices(self.node_id, items)
+                .await
+            {
+                Ok(()) => {
+                    self.device_limiter.record_panel_report(&report);
+                    let mut previous = self.reported_online.lock();
+                    for (user_id, ips) in report {
+                        if ips.is_empty() {
+                            previous.remove(&user_id);
+                        } else {
+                            previous.insert(user_id, ips);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(node_id = self.node_id, error = %e, "Online IP report failed; will retry")
+                }
             }
         }
 
@@ -1585,6 +1612,48 @@ mod tests {
         );
         info.server_port = 0;
         assert!(runner.inbound_context(&info).is_err());
+    }
+
+    #[tokio::test]
+    async fn offline_ip_reports_are_explicit_and_retried_after_failure() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut runner = runner(format!("http://{}", listener.local_addr().unwrap()));
+            let directory = std::env::temp_dir().join(format!("elise-online-{}", uuid::Uuid::new_v4()));
+            runner.traffic_path = directory.join("traffic.json");
+            runner.restore_pending().unwrap();
+            let mut config = (*runner.global_config).clone();
+            config.submit_alive_ip_min_traffic = 0;
+            runner.global_config = Arc::new(config);
+            let server = tokio::spawn(async move {
+                for step in 0..3 {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut header = Vec::new();
+                    while !header.ends_with(b"\r\n\r\n") { header.push(stream.read_u8().await.unwrap()); }
+                    let header = String::from_utf8(header).unwrap().to_lowercase();
+                    assert!(header.contains("/mod_mu/users/aliveip?"));
+                    let length = header.lines().find_map(|line| line.strip_prefix("content-length:")).unwrap().trim().parse().unwrap();
+                    let mut body = vec![0; length];
+                    stream.read_exact(&mut body).await.unwrap();
+                    let devices: Vec<OnlineDeviceItem> = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(devices.len(), 1);
+                    assert_eq!(devices[0].user_id, 7);
+                    assert_eq!(devices[0].ips, if step == 0 { vec!["192.0.2.7".to_owned()] } else { vec![] });
+                    let status = if step == 1 { "500 Internal Server Error" } else { "200 OK" };
+                    stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}").as_bytes()).await.unwrap();
+                }
+            });
+            let guard = runner.device_limiter.try_acquire_async(7, "192.0.2.7".parse().unwrap()).await.unwrap();
+            runner.report_data(false).await;
+            assert!(runner.reported_online.lock().contains_key(&7));
+            drop(guard);
+            runner.report_data(false).await;
+            assert!(runner.reported_online.lock().contains_key(&7));
+            runner.report_data(false).await;
+            assert!(runner.reported_online.lock().is_empty());
+            server.await.unwrap();
+            std::fs::remove_dir_all(directory).unwrap();
+        }).await.unwrap();
     }
 
     #[tokio::test]

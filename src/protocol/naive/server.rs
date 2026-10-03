@@ -400,21 +400,21 @@ async fn process_h2_connect(
         conn_id, ctx.node_id, remote_addr, target_str
     );
 
-    if !ctx
+    let Some(device_guard) = ctx
         .device_limiter
-        .check_and_record_async(user.id, client_ip)
+        .try_acquire_async(user.id, client_ip)
         .await
-    {
+    else {
         let resp = Response::builder()
             .status(StatusCode::FORBIDDEN)
             .body(())
             .unwrap();
         let _ = respond.send_response(resp, true);
         return Ok(());
-    }
+    };
 
     let _conn_guard = match ctx.conn_limiter.try_acquire(user.id) {
-        Some(g) => g,
+        Some(g) => g.with_device(device_guard),
         None => {
             let resp = Response::builder()
                 .status(StatusCode::TOO_MANY_REQUESTS)
@@ -680,19 +680,19 @@ async fn handle_http1_stream(
         conn_id, ctx.node_id, remote_addr, target
     );
 
-    if !ctx
+    let Some(device_guard) = ctx
         .device_limiter
-        .check_and_record_async(user.id, client_ip)
+        .try_acquire_async(user.id, client_ip)
         .await
-    {
+    else {
         let _ = stream
             .write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
             .await;
         return Ok(());
-    }
+    };
 
     let _conn_guard = match ctx.conn_limiter.try_acquire(user.id) {
-        Some(g) => g,
+        Some(g) => g.with_device(device_guard),
         None => {
             let _ = stream
                 .write_all(b"HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n")

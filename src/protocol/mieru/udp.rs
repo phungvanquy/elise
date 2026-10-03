@@ -214,15 +214,15 @@ async fn handle_udp_packet(
         }
     }
 
-    if !ctx
+    let Some(device_guard) = ctx
         .device_limiter
-        .check_and_record_async(user.panel_user.id, client_ip)
+        .try_acquire_async(user.panel_user.id, client_ip)
         .await
-    {
+    else {
         return Ok(());
-    }
+    };
     let conn_guard = match ctx.conn_limiter.try_acquire(user.panel_user.id) {
-        Some(g) => g,
+        Some(g) => g.with_device(device_guard),
         None => return Ok(()),
     };
 

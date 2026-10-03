@@ -591,7 +591,12 @@ impl XiaoV2BoardClient {
             payload.insert(item.user_id.to_string(), item.ips);
         }
 
-        let _ = self.client.post(&url).json(&payload).send().await;
+        self.client
+            .post(&url)
+            .json(&payload)
+            .send()
+            .await?
+            .error_for_status()?;
         Ok(())
     }
 

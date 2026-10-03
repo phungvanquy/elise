@@ -172,8 +172,8 @@ async fn handle_tcp_connection(
                         writer.lock().await.write_control(&state, PROTOCOL_CLOSE_SESSION_REQ).await?;
                         continue;
                     };
-                    let guard = if ctx.device_limiter.check_and_record_async(user.id, client_ip).await {
-                        ctx.conn_limiter.try_acquire(user.id)
+                    let guard = if let Some(device) = ctx.device_limiter.try_acquire_async(user.id, client_ip).await {
+                        ctx.conn_limiter.try_acquire(user.id).map(|guard| guard.with_device(device))
                     } else { None };
                     let Some(guard) = guard else {
                         writer.lock().await.write_control(&state, PROTOCOL_CLOSE_SESSION_REQ).await?;

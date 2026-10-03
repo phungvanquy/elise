@@ -432,20 +432,20 @@ async fn handle_hy1_connection(
             }
         };
 
-        if !ctx
+        let Some(device_guard) = ctx
             .device_limiter
-            .check_and_record_async(user.id, client_ip)
+            .try_acquire_async(user.id, client_ip)
             .await
-        {
+        else {
             conn.close(1u32.into(), b"device limit exceeded");
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "Device limit",
             ));
-        }
+        };
 
         let conn_guard = match ctx.conn_limiter.try_acquire(user.id) {
-            Some(g) => g,
+            Some(g) => g.with_device(device_guard),
             None => {
                 conn.close(1u32.into(), b"connection limit reached");
                 return Err(io::Error::new(

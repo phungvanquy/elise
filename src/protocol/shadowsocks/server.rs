@@ -789,15 +789,15 @@ async fn handle_stream(
     };
     ss_defense.record_success(remote_addr.ip());
     ctx.ip_user_cache.insert(remote_addr.ip(), user.id);
-    if !ctx
+    let Some(device_guard) = ctx
         .device_limiter
-        .check_and_record_async(user.id, remote_addr.ip())
+        .try_acquire_async(user.id, remote_addr.ip())
         .await
-    {
+    else {
         return Ok(());
-    }
+    };
     let _conn_guard = match ctx.conn_limiter.try_acquire(user.id) {
-        Some(guard) => guard,
+        Some(guard) => guard.with_device(device_guard),
         None => return Ok(()),
     };
     let (sniffed, stream) = match crate::conn::sniff_and_detect_stream(

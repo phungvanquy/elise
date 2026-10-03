@@ -215,6 +215,8 @@ pub struct TuicV4Session {
     auth_done: Arc<Notify>,
     auth_ok: Arc<AtomicBool>,
     authenticated_user: Arc<Mutex<Option<User>>>,
+    // Keep earlier authenticated users counted while their child streams run.
+    device_guards: Mutex<HashMap<u32, crate::limiter::device::DeviceGuard>>,
     udp_sessions: Arc<Mutex<HashMap<u32, mpsc::Sender<(TuicV4Address, Vec<u8>, TuicV4RelayMode)>>>>,
     cancel: CancellationToken,
     tasks: Mutex<tokio::task::JoinSet<()>>,
@@ -238,6 +240,7 @@ impl TuicV4Session {
             auth_done: Arc::new(Notify::new()),
             auth_ok: Arc::new(AtomicBool::new(false)),
             authenticated_user: Arc::new(Mutex::new(None)),
+            device_guards: Mutex::new(HashMap::new()),
             udp_sessions: Arc::new(Mutex::new(HashMap::new())),
             cancel: cancel.child_token(),
             tasks: Mutex::new(tokio::task::JoinSet::new()),
@@ -285,6 +288,7 @@ impl TuicV4Session {
             }
         }
         self.udp_sessions.lock().clear();
+        self.device_guards.lock().clear();
     }
 
     fn spawn(
@@ -406,18 +410,19 @@ impl TuicV4Session {
                 match matched_user {
                     Some((user, _)) => {
                         self.ctx.defense.record_success(client_ip);
-                        if !self
+                        let Some(guard) = self
                             .ctx
                             .device_limiter
-                            .check_and_record_async(user.id, client_ip)
+                            .try_acquire_async(user.id, client_ip)
                             .await
-                        {
+                        else {
                             let _ = self.quic_conn.close(
                                 quinn::VarInt::from_u32(ERR_AUTHENTICATION_FAILED),
                                 b"DeviceLimitExceeded",
                             );
                             return;
-                        }
+                        };
+                        self.device_guards.lock().insert(user.id, guard);
 
                         *self.authenticated_user.lock() = Some(user);
                         self.auth_ok.store(true, Ordering::Release);

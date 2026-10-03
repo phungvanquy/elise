@@ -499,16 +499,16 @@ async fn perform_vless_stream_handshake(
         },
     );
 
-    if !ctx
+    let Some(device_guard) = ctx
         .device_limiter
-        .check_and_record_async(user.id, remote_addr.ip())
+        .try_acquire_async(user.id, remote_addr.ip())
         .await
-    {
+    else {
         return Ok(None);
-    }
+    };
 
     let conn_guard = match ctx.conn_limiter.try_acquire(user.id) {
-        Some(g) => g,
+        Some(g) => g.with_device(device_guard),
         None => return Ok(None),
     };
 
@@ -1095,6 +1095,83 @@ mod tests {
             global_config: Arc::new(config),
             ip_user_cache: Arc::new(crate::limiter::IpUserCache::new(1, false, "")),
         }
+    }
+
+    #[tokio::test]
+    async fn ip_slot_is_released_when_vless_client_disconnects() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let target_port = upstream.local_addr().unwrap().port();
+            let echo = tokio::spawn(async move {
+                loop {
+                    let (stream, _) = upstream.accept().await.unwrap();
+                    tokio::spawn(async move {
+                        let (mut read, mut write) = stream.into_split();
+                        let _ = tokio::io::copy(&mut read, &mut write).await;
+                    });
+                }
+            });
+            let port_socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = port_socket.local_addr().unwrap().port();
+            drop(port_socket);
+            let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(false);
+            let mut ctx = context(Arc::new(|_, _, _| {}));
+            ctx.port = port;
+            ctx.ready = Some(ready_tx);
+            ctx.device_limiter.set_user_limit(7, 1);
+            let limiter = ctx.device_limiter.clone();
+            let inbound = VlessInbound::new();
+            inbound.update_users(vec![User {
+                id: 7,
+                uuid: "01010101-0101-0101-0101-010101010101".into(),
+                ..Default::default()
+            }]);
+            let info = NodeInfo {
+                node_type: "vless".into(),
+                server_port: port,
+                network: Some("tcp".into()),
+                tls: Some(0),
+                ..Default::default()
+            };
+            let (stop, shutdown) = tokio::sync::broadcast::channel(1);
+            let server = tokio::spawn(async move { inbound.start(ctx, info, shutdown).await });
+            ready_rx.changed().await.unwrap();
+            let mut request = vec![0];
+            request.extend_from_slice(&[1; 16]);
+            request.extend_from_slice(&[0, 1]); // no addons, TCP
+            request.extend_from_slice(&target_port.to_be_bytes());
+            request.extend_from_slice(&[1, 127, 0, 0, 1]);
+            request.extend_from_slice(b"ping");
+            async fn connect(ip: &str, port: u16, request: &[u8]) -> TcpStream {
+                let socket = tokio::net::TcpSocket::new_v4().unwrap();
+                socket.bind(format!("{ip}:0").parse().unwrap()).unwrap();
+                let mut stream = socket
+                    .connect(format!("127.0.0.1:{port}").parse().unwrap())
+                    .await
+                    .unwrap();
+                stream.write_all(request).await.unwrap();
+                stream
+            }
+            let mut first = connect("127.0.0.2", port, &request).await;
+            let mut reply = [0; 6];
+            first.read_exact(&mut reply).await.unwrap();
+            assert_eq!(&reply, b"\0\0ping");
+            let mut denied = connect("127.0.0.3", port, &request).await;
+            assert!(denied.read_exact(&mut reply).await.is_err());
+            drop(first);
+            while !limiter.get_all_online_devices().is_empty() {
+                tokio::task::yield_now().await;
+            }
+            let mut second = connect("127.0.0.3", port, &request).await;
+            second.read_exact(&mut reply).await.unwrap();
+            assert_eq!(&reply, b"\0\0ping");
+            drop(second);
+            stop.send(()).unwrap();
+            server.await.unwrap().unwrap();
+            echo.abort();
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

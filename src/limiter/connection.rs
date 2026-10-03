@@ -28,7 +28,12 @@ impl ConnectionLimiter {
 
         let limit = match max_limit {
             Some(l) if l > 0 => l,
-            _ => return Some(ConnGuard { counter: None }),
+            _ => {
+                return Some(ConnGuard {
+                    counter: None,
+                    device: None,
+                })
+            }
         };
 
         let counter = {
@@ -59,6 +64,7 @@ impl ConnectionLimiter {
 
         Some(ConnGuard {
             counter: Some(counter),
+            device: None,
         })
     }
 
@@ -78,6 +84,14 @@ impl ConnectionLimiter {
 
 pub struct ConnGuard {
     counter: Option<Arc<AtomicU32>>,
+    device: Option<super::device::DeviceGuard>,
+}
+
+impl ConnGuard {
+    pub fn with_device(mut self, device: super::device::DeviceGuard) -> Self {
+        self.device = Some(device);
+        self
+    }
 }
 
 impl Drop for ConnGuard {

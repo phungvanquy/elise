@@ -142,16 +142,16 @@ async fn handle_connection(
     };
     ctx.defense.record_success(remote_addr.ip());
 
-    if !ctx
+    let Some(device_guard) = ctx
         .device_limiter
-        .check_and_record_async(user.id, remote_addr.ip())
+        .try_acquire_async(user.id, remote_addr.ip())
         .await
-    {
+    else {
         return Ok(());
-    }
+    };
 
     let _conn_guard = match ctx.conn_limiter.try_acquire(user.id) {
-        Some(g) => g,
+        Some(g) => g.with_device(device_guard),
         None => return Ok(()),
     };
 
