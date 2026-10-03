@@ -119,13 +119,14 @@ pub struct HttpUpgradeTransportConfig {
     pub max_early_data: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct XHttpTransportConfig {
     pub mode: String,
     pub host: Option<String>,
     pub path: String,
     pub headers: HashMap<String, String>,
     pub extra: Option<serde_json::Value>,
+    pub sessions: std::sync::Arc<super::xhttp::Sessions>,
 }
 
 #[derive(Debug, Clone)]
@@ -640,13 +641,16 @@ impl StreamSettings {
                     extra = ns.get("extra").cloned();
                 }
 
-                TransportConfig::XHttp(XHttpTransportConfig {
+                let config = XHttpTransportConfig {
                     mode,
                     host,
                     path,
                     headers,
                     extra,
-                })
+                    sessions: Default::default(),
+                };
+                super::xhttp::validate_config(&config)?;
+                TransportConfig::XHttp(config)
             }
             "h2" | "http" | "http2" => {
                 let mut path = node_info.path.clone().unwrap_or_else(|| "/".to_string());

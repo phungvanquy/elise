@@ -1,718 +1,350 @@
+mod options;
+mod sessions;
+
+pub use sessions::Sessions;
+
 use crate::conn::{AutoFlushingStream, BoxedStream, PrefixedStream};
 use crate::transport::types::XHttpTransportConfig;
-use bytes::{Buf, Bytes, BytesMut};
-use h2::server;
-use h2::RecvStream;
-use http::{Response, StatusCode};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use bytes::Bytes;
+use futures_util::TryStreamExt;
+use http::{Method, Request, Response, StatusCode};
+use http_body_util::BodyExt;
+use hyper::body::{Body, Frame, Incoming, SizeHint};
+use hyper::service::service_fn;
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use options::{cookie, header, DataPlacement, Options};
+use parking_lot::Mutex;
+use rand::Rng;
+use sessions::{Session, SessionGuard};
+use std::convert::Infallible;
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::sync::mpsc;
+use tokio::task::AbortHandle;
+use tokio_util::io::StreamReader;
 
-pub async fn apply_xhttp_transport(
-    mut stream: BoxedStream,
-    config: &XHttpTransportConfig,
-) -> io::Result<BoxedStream> {
-    let mut probe_buf = [0u8; 4];
-    stream.read_exact(&mut probe_buf).await?;
-
-    if &probe_buf == b"PRI " {
-        let prefixed = Box::new(PrefixedStream::new(stream, Some(probe_buf.to_vec())));
-        return apply_xhttp_h2(prefixed, config).await;
-    }
-
-    apply_xhttp_http1(stream, &probe_buf, config).await
+pub(crate) fn validate_config(config: &XHttpTransportConfig) -> Result<(), String> {
+    Options::parse(config).map(|_| ())
 }
 
-async fn apply_xhttp_h2(
-    stream: BoxedStream,
+pub async fn serve_xhttp<F, Fut>(
+    mut stream: BoxedStream,
     config: &XHttpTransportConfig,
-) -> io::Result<BoxedStream> {
-    let mut builder = server::Builder::default();
-    builder.initial_window_size(4 * 1024 * 1024);
-    builder.initial_connection_window_size(8 * 1024 * 1024);
-    builder.max_concurrent_streams(1024);
-
-    let stream = Box::new(AutoFlushingStream::new(stream));
-    let mut connection = builder.handshake(stream).await.map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::ConnectionReset,
-            format!("H2 handshake failed: {e}"),
-        )
-    })?;
-
-    let (request, mut respond) = match connection.accept().await {
-        Some(Ok(pair)) => pair,
-        Some(Err(e)) => {
-            return Err(io::Error::new(
-                io::ErrorKind::ConnectionReset,
-                format!("failed to accept XHTTP stream: {e}"),
-            ));
+    handler: F,
+) -> io::Result<()>
+where
+    F: FnMut(BoxedStream) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let options = Arc::new(
+        Options::parse(config).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
+    );
+    let max_headers = options.max_headers;
+    let sessions = config.sessions.clone();
+    let handler = Arc::new(Mutex::new(handler));
+    let service = service_fn(move |req| {
+        let (options, sessions, handler) = (options.clone(), sessions.clone(), handler.clone());
+        async move {
+            Ok::<_, Infallible>(match handle(req, &options, &sessions, handler).await {
+                Ok(response) => response,
+                Err(status) => response(&options, status, ChannelBody::empty(), false),
+            })
         }
-        None => {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "H2 connection closed before XHTTP stream was accepted",
-            ));
-        }
-    };
-
-    let path = request.uri().path();
-    let norm_config = if config.path.starts_with('/') {
-        config.path.clone()
-    } else {
-        format!("/{}", config.path)
-    };
-    let normalized_config_path = norm_config.trim_end_matches('/');
-    let normalized_req_path = path.trim_end_matches('/');
-
-    if !normalized_config_path.is_empty()
-        && normalized_req_path != normalized_config_path
-        && !normalized_req_path.starts_with(normalized_config_path)
-    {
-        let resp = Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(())
-            .unwrap();
-        let _ = respond.send_response(resp, true);
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!(
-                "XHTTP path mismatch: expected prefix '{}', got '{path}'",
-                config.path
-            ),
-        ));
-    }
-
-    if let Some(ref expected_host) = config.host {
-        let clean_expected = expected_host.trim();
-        if !clean_expected.is_empty() {
-            let req_host = request.uri().authority().map(|a| a.host()).or_else(|| {
-                request
-                    .headers()
-                    .get("host")
-                    .and_then(|h| h.to_str().ok())
-                    .map(|h| h.split(':').next().unwrap_or(h))
-            });
-
-            if let Some(clean_req) = req_host {
-                let clean_exp = clean_expected.split(':').next().unwrap_or(clean_expected);
-                if !clean_req.eq_ignore_ascii_case(clean_exp) {
-                    let resp = Response::builder()
-                        .status(StatusCode::NOT_FOUND)
-                        .body(())
-                        .unwrap();
-                    let _ = respond.send_response(resp, true);
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        format!(
-                            "XHTTP host mismatch: expected '{expected_host}', got '{clean_req}'"
-                        ),
-                    ));
-                }
-            }
-        }
-    }
-
-    let response = Response::builder()
-        .status(StatusCode::OK)
-        .header("cache-control", "no-store")
-        .header("x-accel-buffering", "no")
-        .header("content-type", "text/event-stream")
-        .body(())
-        .unwrap();
-
-    let send_stream = respond.send_response(response, false).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            format!("failed to send XHTTP response: {e}"),
-        )
-    })?;
-
-    let recv_stream = request.into_body();
-
-    tokio::spawn(async move {
-        let _ = std::future::poll_fn(|cx| {
-            while let Poll::Ready(Some(res)) = connection.poll_accept(cx) {
-                if let Ok((_req, mut resp)) = res {
-                    let r = Response::builder().status(StatusCode::OK).body(()).unwrap();
-                    let _ = resp.send_response(r, true);
-                }
-            }
-            connection.poll_closed(cx)
-        })
-        .await;
     });
-
-    Ok(Box::new(XHttpStreamWrapper {
-        recv_stream,
-        send_stream,
-        read_buf: BytesMut::new(),
-    }))
+    let mut prefix = [0; 4];
+    tokio::time::timeout(Duration::from_secs(15), stream.read_exact(&mut prefix)).await??;
+    let stream = PrefixedStream::new(stream, Some(prefix.to_vec()));
+    let io = TokioIo::new(AutoFlushingStream::new(stream));
+    let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+    builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(Duration::from_secs(15))
+        .max_buf_size(max_headers.max(8192));
+    builder
+        .http2()
+        .max_header_list_size(max_headers as u32)
+        .max_concurrent_streams(128);
+    builder
+        .serve_connection(io, service)
+        .await
+        .map_err(io::Error::other)
 }
 
-pub struct XHttpStreamWrapper {
-    recv_stream: RecvStream,
-    send_stream: h2::SendStream<Bytes>,
-    read_buf: BytesMut,
-}
-
-impl AsyncRead for XHttpStreamWrapper {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        output: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        if output.remaining() == 0 {
-            return Poll::Ready(Ok(()));
-        }
-
-        loop {
-            if !self.read_buf.is_empty() {
-                let n = output.remaining().min(self.read_buf.len());
-                output.put_slice(&self.read_buf[..n]);
-                self.read_buf.advance(n);
-                return Poll::Ready(Ok(()));
-            }
-
-            match Pin::new(&mut self.recv_stream).poll_data(cx) {
-                Poll::Ready(Some(Ok(chunk))) => {
-                    let _ = self
-                        .recv_stream
-                        .flow_control()
-                        .release_capacity(chunk.len());
-                    self.read_buf.extend_from_slice(&chunk);
-                }
-                Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::ConnectionReset,
-                        format!("XHTTP recv error: {e}"),
-                    )));
-                }
-                Poll::Ready(None) => return Poll::Ready(Ok(())),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-    }
-}
-
-impl AsyncWrite for XHttpStreamWrapper {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        data: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        if data.is_empty() {
-            return Poll::Ready(Ok(0));
-        }
-
-        let mut avail = self.send_stream.capacity();
-        if avail == 0 {
-            self.send_stream.reserve_capacity(data.len().max(16384));
-            match self.send_stream.poll_capacity(cx) {
-                Poll::Ready(Some(Ok(new_cap))) => {
-                    avail = new_cap;
-                }
-                Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::ConnectionReset,
-                        format!("XHTTP send capacity error: {e}"),
-                    )));
-                }
-                Poll::Ready(None) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "XHTTP send stream closed",
-                    )));
-                }
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-
-        if avail == 0 {
-            return Poll::Pending;
-        }
-
-        let chunk_size = data.len().min(avail).min(16384);
-        let to_send = Bytes::copy_from_slice(&data[..chunk_size]);
-
-        self.send_stream.send_data(to_send, false).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("XHTTP send_data failed: {e}"))
-        })?;
-
-        if self.send_stream.capacity() < 32768 {
-            self.send_stream.reserve_capacity(65536);
-        }
-
-        Poll::Ready(Ok(chunk_size))
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let _ = self.send_stream.send_data(Bytes::new(), true);
-        Poll::Ready(Ok(()))
-    }
-}
-
-async fn apply_xhttp_http1(
-    mut stream: BoxedStream,
-    initial_bytes: &[u8],
-    config: &XHttpTransportConfig,
-) -> io::Result<BoxedStream> {
-    let mut header_buf = Vec::with_capacity(1024);
-    header_buf.extend_from_slice(initial_bytes);
-
-    let mut chunk = [0u8; 1024];
-    let mut header_end = None;
-
-    while header_buf.len() < 12288 {
-        if let Some(pos) = find_subslice(&header_buf, b"\r\n\r\n") {
-            header_end = Some(pos);
-            break;
-        }
-        let n = stream.read(&mut chunk).await?;
-        if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "connection closed before HTTP/1.1 request completed",
-            ));
-        }
-        header_buf.extend_from_slice(&chunk[..n]);
-    }
-
-    let end_idx = header_end.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "HTTP request headers exceeded max length (12288 bytes)",
-        )
-    })?;
-
-    let header_str = String::from_utf8_lossy(&header_buf[..end_idx]);
-    let mut lines = header_str.lines();
-    let request_line = lines
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty HTTP request"))?;
-    let parts: Vec<&str> = request_line.split_whitespace().collect();
-    if parts.len() < 3 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("invalid HTTP request line: {request_line}"),
-        ));
-    }
-    let req_path = parts[1];
-    let norm_config = if config.path.starts_with('/') {
-        config.path.clone()
-    } else {
-        format!("/{}", config.path)
-    };
-    let normalized_config_path = norm_config.trim_end_matches('/');
-    let normalized_req_path = req_path.trim_end_matches('/');
-
-    if !normalized_config_path.is_empty()
-        && normalized_req_path != normalized_config_path
-        && !normalized_req_path.starts_with(normalized_config_path)
-    {
-        let _ = stream
-            .write_all(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
-            .await;
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!(
-                "XHTTP path mismatch: expected prefix '{}', got '{req_path}'",
-                config.path
+async fn handle<F, Fut>(
+    mut req: Request<Incoming>,
+    options: &Options,
+    sessions: &Arc<Sessions>,
+    handler: Arc<Mutex<F>>,
+) -> Result<Response<ChannelBody>, StatusCode>
+where
+    F: FnMut(BoxedStream) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    options.validate(&req)?;
+    if req.method() == Method::OPTIONS {
+        let mut response = response(options, StatusCode::OK, ChannelBody::empty(), false);
+        for (target, source) in [
+            ("access-control-allow-origin", "origin"),
+            (
+                "access-control-allow-methods",
+                "access-control-request-method",
             ),
+            (
+                "access-control-allow-headers",
+                "access-control-request-headers",
+            ),
+        ] {
+            response.headers_mut().insert(
+                target,
+                req.headers()
+                    .get(source)
+                    .cloned()
+                    .unwrap_or(http::HeaderValue::from_static("*")),
+            );
+        }
+        return Ok(response);
+    }
+    let (session_id, seq) = options.metadata(&req);
+    if session_id.len() > 256 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if session_id.is_empty() {
+        if !matches!(options.mode.as_str(), "auto" | "stream-one" | "stream-up") {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        let reader =
+            StreamReader::new(req.into_body().into_data_stream().map_err(io::Error::other));
+        let body = stream_body(reader, handler, None);
+        return Ok(response(options, StatusCode::OK, body, true));
+    }
+    if req.method() == Method::GET && seq.is_empty() {
+        if options.mode == "stream-one" {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        let session = sessions.get(&session_id)?;
+        let reader = session.reader()?;
+        let guard = sessions.guard(session_id, session);
+        let body = stream_body(reader, handler, Some(guard));
+        return Ok(response(options, StatusCode::OK, body, true));
+    }
+    if seq.is_empty() {
+        if !matches!(options.mode.as_str(), "auto" | "stream-up") {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        let session = sessions.get(&session_id)?;
+        session.attach_upload(req.into_body())?;
+        let guard = sessions.guard(session_id, session.clone());
+        return Ok(response(
+            options,
+            StatusCode::OK,
+            upload_body(options, session, guard),
+            false,
         ));
     }
+    if !matches!(options.mode.as_str(), "auto" | "packet-up") {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let seq = seq.parse::<u64>().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let data = tokio::time::timeout(Duration::from_secs(30), payload(&mut req, options))
+        .await
+        .map_err(|_| StatusCode::REQUEST_TIMEOUT)??;
+    let session = sessions.get(&session_id)?;
+    session.push(seq, data, options.max_buffered)?;
+    Ok(response(
+        options,
+        StatusCode::OK,
+        ChannelBody::empty(),
+        false,
+    ))
+}
 
-    if let Some(ref expected_host) = config.host {
-        let clean_expected = expected_host.trim();
-        if !clean_expected.is_empty() {
-            let mut host_header = None;
-            for line in lines {
-                if let Some((k, v)) = line.split_once(':') {
-                    if k.trim().eq_ignore_ascii_case("host") {
-                        host_header = Some(v.trim());
+async fn payload(req: &mut Request<Incoming>, options: &Options) -> Result<Bytes, StatusCode> {
+    let mut data = Vec::new();
+    for placement in [DataPlacement::Header, DataPlacement::Cookie] {
+        if options.data_placement != DataPlacement::Auto && options.data_placement != placement {
+            continue;
+        }
+        let mut encoded = String::new();
+        for index in 0.. {
+            let chunk = match placement {
+                DataPlacement::Header => {
+                    header(req.headers(), &format!("{}-{index}", options.data_key))
+                        .map(str::to_owned)
+                }
+                _ => cookie(req.headers(), &format!("{}_{index}", options.data_key)),
+            };
+            let Some(chunk) = chunk.filter(|s| !s.is_empty()) else {
+                break;
+            };
+            encoded.push_str(&chunk);
+            if encoded.len() > options.max_post.div_ceil(3) * 4 {
+                return Err(StatusCode::PAYLOAD_TOO_LARGE);
+            }
+        }
+        data.extend(
+            URL_SAFE_NO_PAD
+                .decode(encoded)
+                .map_err(|_| StatusCode::BAD_REQUEST)?,
+        );
+        if data.len() > options.max_post {
+            return Err(StatusCode::PAYLOAD_TOO_LARGE);
+        }
+    }
+    if matches!(
+        options.data_placement,
+        DataPlacement::Auto | DataPlacement::Body
+    ) {
+        while let Some(frame) = req.body_mut().frame().await {
+            let frame = frame.map_err(|_| StatusCode::BAD_REQUEST)?;
+            if let Ok(chunk) = frame.into_data() {
+                if chunk.len() > options.max_post - data.len() {
+                    return Err(StatusCode::PAYLOAD_TOO_LARGE);
+                }
+                data.extend_from_slice(&chunk);
+            }
+        }
+    }
+    Ok(Bytes::from(data))
+}
+
+fn response(
+    options: &Options,
+    status: StatusCode,
+    body: ChannelBody,
+    streaming: bool,
+) -> Response<ChannelBody> {
+    let mut response = Response::new(body);
+    *response.status_mut() = status;
+    *response.headers_mut() = options.response_headers(streaming);
+    response
+}
+
+struct ChannelBody {
+    receiver: mpsc::Receiver<Result<Frame<Bytes>, io::Error>>,
+    task: Option<AbortHandle>,
+}
+
+impl ChannelBody {
+    fn empty() -> Self {
+        let (_, receiver) = mpsc::channel(1);
+        Self {
+            receiver,
+            task: None,
+        }
+    }
+}
+
+impl Body for ChannelBody {
+    type Data = Bytes;
+    type Error = io::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
+        self.receiver.poll_recv(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.receiver.is_closed() && self.receiver.is_empty()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        if self.task.is_none() {
+            SizeHint::with_exact(0)
+        } else {
+            SizeHint::default()
+        }
+    }
+}
+
+impl Drop for ChannelBody {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+}
+
+fn stream_body<R, F, Fut>(
+    reader: R,
+    handler: Arc<Mutex<F>>,
+    guard: Option<SessionGuard>,
+) -> ChannelBody
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    F: FnMut(BoxedStream) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let (writer, mut downstream) = tokio::io::duplex(64 * 1024);
+    let stream = Box::new(tokio::io::join(reader, writer));
+    let handle = handler.lock()(stream);
+    let (sender, receiver) = mpsc::channel(4);
+    let task = tokio::spawn(async move {
+        let _guard = guard;
+        let pump = async move {
+            let mut buffer = vec![0; 16 * 1024];
+            loop {
+                match downstream.read(&mut buffer).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if sender
+                            .send(Ok(Frame::data(Bytes::copy_from_slice(&buffer[..n]))))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = sender.send(Err(e)).await;
                         break;
                     }
                 }
             }
-            if let Some(host_val) = host_header {
-                let clean_req = host_val.split(':').next().unwrap_or(host_val);
-                let clean_exp = clean_expected.split(':').next().unwrap_or(clean_expected);
-                if !clean_req.eq_ignore_ascii_case(clean_exp) {
-                    let _ = stream
-                        .write_all(
-                            b"HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
-                        )
-                        .await;
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        format!(
-                            "XHTTP host mismatch: expected '{expected_host}', got '{host_val}'"
-                        ),
-                    ));
-                }
-            }
-        }
+        };
+        tokio::join!(handle, pump);
+    });
+    ChannelBody {
+        receiver,
+        task: Some(task.abort_handle()),
     }
-
-    let response = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nX-Accel-Buffering: no\r\nTransfer-Encoding: chunked\r\n\r\n";
-    stream.write_all(response).await?;
-    stream.flush().await?;
-
-    let unconsumed = header_buf[end_idx + 4..].to_vec();
-    let mut initial_read_buf = BytesMut::new();
-    if !unconsumed.is_empty() {
-        initial_read_buf.extend_from_slice(&unconsumed);
-    }
-
-    Ok(Box::new(XHttpChunkedStream {
-        inner: stream,
-        state: ChunkState::ReadingLength,
-        read_buf: initial_read_buf,
-        write_buf: BytesMut::new(),
-        has_sent_eof: false,
-    }))
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum ChunkState {
-    ReadingLength,
-    ReadingData(usize),
-    ReadingCrlf,
-    ReadingTrailer,
-    Eof,
-}
-
-pub struct XHttpChunkedStream<S> {
-    inner: S,
-    state: ChunkState,
-    read_buf: BytesMut,
-    write_buf: BytesMut,
-    has_sent_eof: bool,
-}
-
-impl<S: AsyncRead + AsyncWrite + Send + Unpin> AsyncRead for XHttpChunkedStream<S> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        output: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        if output.remaining() == 0 {
-            return Poll::Ready(Ok(()));
-        }
-
+fn upload_body(options: &Options, session: Arc<Session>, guard: SessionGuard) -> ChannelBody {
+    let mut closed = session.closed.subscribe();
+    let padding = options.padding.clone();
+    let interval = options.stream_up_secs.clone();
+    let (sender, receiver) = mpsc::channel(1);
+    let task = tokio::spawn(async move {
+        let _guard = guard;
         loop {
-            match self.state {
-                ChunkState::ReadingLength => {
-                    if let Some(pos) = find_subslice(&self.read_buf, b"\r\n") {
-                        let line = &self.read_buf[..pos];
-                        let line_str = match std::str::from_utf8(line) {
-                            Ok(s) => s,
-                            Err(_) => {
-                                return Poll::Ready(Err(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "invalid chunk length utf-8",
-                                )));
-                            }
-                        };
-                        let hex_str = line_str.split(';').next().unwrap_or("").trim();
-                        let chunk_len = match usize::from_str_radix(hex_str, 16) {
-                            Ok(n) => n,
-                            Err(e) => {
-                                return Poll::Ready(Err(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    format!("invalid chunk hex '{hex_str}': {e}"),
-                                )));
-                            }
-                        };
-                        self.read_buf.advance(pos + 2);
-
-                        if chunk_len == 0 {
-                            self.state = ChunkState::ReadingTrailer;
-                        } else {
-                            self.state = ChunkState::ReadingData(chunk_len);
-                        }
-                    } else {
-                        let mut temp = [0u8; 8192];
-                        let mut temp_buf = ReadBuf::new(&mut temp);
-                        match Pin::new(&mut self.inner).poll_read(cx, &mut temp_buf) {
-                            Poll::Ready(Ok(())) => {
-                                let n = temp_buf.filled().len();
-                                if n == 0 {
-                                    return Poll::Ready(Ok(()));
-                                }
-                                self.read_buf.extend_from_slice(temp_buf.filled());
-                            }
-                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                            Poll::Pending => return Poll::Pending,
-                        }
-                    }
-                }
-                ChunkState::ReadingData(rem) => {
-                    if !self.read_buf.is_empty() {
-                        let to_copy = output.remaining().min(self.read_buf.len()).min(rem);
-                        output.put_slice(&self.read_buf[..to_copy]);
-                        self.read_buf.advance(to_copy);
-                        let next_rem = rem - to_copy;
-                        if next_rem == 0 {
-                            self.state = ChunkState::ReadingCrlf;
-                        } else {
-                            self.state = ChunkState::ReadingData(next_rem);
-                        }
-                        return Poll::Ready(Ok(()));
-                    } else {
-                        let mut temp = [0u8; 16384];
-                        let mut temp_buf = ReadBuf::new(&mut temp);
-                        match Pin::new(&mut self.inner).poll_read(cx, &mut temp_buf) {
-                            Poll::Ready(Ok(())) => {
-                                let n = temp_buf.filled().len();
-                                if n == 0 {
-                                    return Poll::Ready(Err(io::Error::new(
-                                        io::ErrorKind::UnexpectedEof,
-                                        "unexpected EOF while reading chunk body",
-                                    )));
-                                }
-                                self.read_buf.extend_from_slice(temp_buf.filled());
-                            }
-                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                            Poll::Pending => return Poll::Pending,
-                        }
-                    }
-                }
-                ChunkState::ReadingCrlf => {
-                    if self.read_buf.len() >= 2 {
-                        self.read_buf.advance(2);
-                        self.state = ChunkState::ReadingLength;
-                    } else {
-                        let mut temp = [0u8; 512];
-                        let mut temp_buf = ReadBuf::new(&mut temp);
-                        match Pin::new(&mut self.inner).poll_read(cx, &mut temp_buf) {
-                            Poll::Ready(Ok(())) => {
-                                let n = temp_buf.filled().len();
-                                if n == 0 {
-                                    return Poll::Ready(Err(io::Error::new(
-                                        io::ErrorKind::UnexpectedEof,
-                                        "unexpected EOF while reading chunk CRLF",
-                                    )));
-                                }
-                                self.read_buf.extend_from_slice(temp_buf.filled());
-                            }
-                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                            Poll::Pending => return Poll::Pending,
-                        }
-                    }
-                }
-                ChunkState::ReadingTrailer => {
-                    if let Some(pos) = find_subslice(&self.read_buf, b"\r\n") {
-                        if pos == 0 {
-                            self.read_buf.advance(2);
-                            self.state = ChunkState::Eof;
-                            return Poll::Ready(Ok(()));
-                        } else {
-                            self.read_buf.advance(pos + 2);
-                        }
-                    } else {
-                        let mut temp = [0u8; 512];
-                        let mut temp_buf = ReadBuf::new(&mut temp);
-                        match Pin::new(&mut self.inner).poll_read(cx, &mut temp_buf) {
-                            Poll::Ready(Ok(())) => {
-                                let n = temp_buf.filled().len();
-                                if n == 0 {
-                                    self.state = ChunkState::Eof;
-                                    return Poll::Ready(Ok(()));
-                                }
-                                self.read_buf.extend_from_slice(temp_buf.filled());
-                            }
-                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                            Poll::Pending => return Poll::Pending,
-                        }
-                    }
-                }
-                ChunkState::Eof => return Poll::Ready(Ok(())),
+            if *closed.borrow() {
+                break;
+            }
+            let data = Bytes::from("X".repeat(rand::thread_rng().gen_range(padding.clone())));
+            if sender.send(Ok(Frame::data(data))).await.is_err() {
+                break;
+            }
+            let delay = Duration::from_secs(rand::thread_rng().gen_range(interval.clone()) as u64);
+            tokio::select! {
+                _ = closed.changed() => break,
+                _ = tokio::time::sleep(delay) => {},
             }
         }
+    });
+    ChannelBody {
+        receiver,
+        task: Some(task.abort_handle()),
     }
-}
-
-impl<S: AsyncRead + AsyncWrite + Send + Unpin> AsyncWrite for XHttpChunkedStream<S> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        data: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        while !this.write_buf.is_empty() {
-            let n = match Pin::new(&mut this.inner).poll_write(cx, &this.write_buf) {
-                Poll::Ready(Ok(n)) => n,
-                Poll::Ready(Err(e)) => {
-                    tracing::warn!("XHttpChunkedStream: poll_write inner drain error: {:?}", e);
-                    return Poll::Ready(Err(e));
-                }
-                Poll::Pending => return Poll::Pending,
-            };
-            this.write_buf.advance(n);
-        }
-
-        if data.is_empty() {
-            return Poll::Ready(Ok(0));
-        }
-
-        let chunk_size = data.len().min(65536);
-        let header = format!("{:X}\r\n", chunk_size);
-        this.write_buf.reserve(header.len() + chunk_size + 2);
-        this.write_buf.extend_from_slice(header.as_bytes());
-        this.write_buf.extend_from_slice(&data[..chunk_size]);
-        this.write_buf.extend_from_slice(b"\r\n");
-
-        while !this.write_buf.is_empty() {
-            match Pin::new(&mut this.inner).poll_write(cx, &this.write_buf) {
-                Poll::Ready(Ok(n)) => this.write_buf.advance(n),
-                Poll::Ready(Err(e)) => {
-                    tracing::warn!("XHttpChunkedStream: poll_write inner send error: {:?}", e);
-                    return Poll::Ready(Err(e));
-                }
-                Poll::Pending => break,
-            }
-        }
-
-        Poll::Ready(Ok(chunk_size))
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        while !this.write_buf.is_empty() {
-            let n = match Pin::new(&mut this.inner).poll_write(cx, &this.write_buf) {
-                Poll::Ready(Ok(n)) => n,
-                Poll::Ready(Err(e)) => {
-                    tracing::warn!("XHttpChunkedStream: poll_flush inner drain error: {:?}", e);
-                    return Poll::Ready(Err(e));
-                }
-                Poll::Pending => return Poll::Pending,
-            };
-            this.write_buf.advance(n);
-        }
-        Pin::new(&mut this.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        if !this.has_sent_eof {
-            this.has_sent_eof = true;
-            this.write_buf.extend_from_slice(b"0\r\n\r\n");
-        }
-        while !this.write_buf.is_empty() {
-            let n = match Pin::new(&mut this.inner).poll_write(cx, &this.write_buf) {
-                Poll::Ready(Ok(n)) => n,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            };
-            this.write_buf.advance(n);
-        }
-        Pin::new(&mut this.inner).poll_flush(cx)
-    }
-}
-
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashMap;
-
-    #[tokio::test]
-    async fn test_xhttp_h2_transport_handshake_and_framing() {
-        let (client, server) = tokio::io::duplex(65536);
-        let config = XHttpTransportConfig {
-            mode: "auto".to_string(),
-            host: Some("example.com".to_string()),
-            path: "/xhttppath".to_string(),
-            headers: HashMap::new(),
-            extra: None,
-        };
-
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-        let server_task = tokio::spawn(async move {
-            let mut stream = apply_xhttp_transport(Box::new(server), &config)
-                .await
-                .expect("server xhttp h2 handshake");
-            let mut buf = [0u8; 4];
-            stream.read_exact(&mut buf).await.unwrap();
-            assert_eq!(&buf, b"ping");
-            stream.write_all(b"pong").await.unwrap();
-            stream.flush().await.unwrap();
-            let _ = done_rx.await;
-        });
-
-        let (mut client_h2, conn) = h2::client::handshake(client)
-            .await
-            .expect("client h2 handshake");
-        tokio::spawn(async move {
-            let _ = conn.await;
-        });
-
-        let req = http::Request::builder()
-            .method("POST")
-            .uri("http://example.com/xhttppath")
-            .header("content-type", "application/octet-stream")
-            .body(())
-            .unwrap();
-
-        let (response, mut send_stream) = client_h2.send_request(req, false).unwrap();
-        let resp = response.await.unwrap();
-        assert_eq!(resp.status(), http::StatusCode::OK);
-
-        send_stream
-            .send_data(Bytes::from_static(b"ping"), false)
-            .unwrap();
-
-        let mut resp_body = resp.into_body();
-        let chunk = resp_body.data().await.unwrap().unwrap();
-        assert_eq!(&chunk[..], b"pong");
-
-        let _ = done_tx.send(());
-        server_task.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_xhttp_http1_chunked_handshake_and_framing() {
-        let (mut client, server) = tokio::io::duplex(65536);
-        let config = XHttpTransportConfig {
-            mode: "auto".to_string(),
-            host: Some("example.com".to_string()),
-            path: "/xhttppath".to_string(),
-            headers: HashMap::new(),
-            extra: None,
-        };
-
-        let server_task = tokio::spawn(async move {
-            let mut stream = apply_xhttp_transport(Box::new(server), &config)
-                .await
-                .expect("server xhttp http1 handshake");
-            let mut buf = [0u8; 4];
-            stream.read_exact(&mut buf).await.unwrap();
-            assert_eq!(&buf, b"ping");
-            stream.write_all(b"pong").await.unwrap();
-            stream.flush().await.unwrap();
-        });
-
-        let req = b"POST /xhttppath HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nping\r\n0\r\n\r\n";
-        client.write_all(req).await.unwrap();
-        client.flush().await.unwrap();
-
-        let mut resp_buf = vec![0u8; 1024];
-        let n = client.read(&mut resp_buf).await.unwrap();
-        let resp_str = String::from_utf8_lossy(&resp_buf[..n]);
-        assert!(resp_str.contains("200 OK"));
-        assert!(resp_str.contains("4\r\npong\r\n") || resp_str.contains("pong"));
-
-        server_task.await.unwrap();
-    }
-}
+mod tests;

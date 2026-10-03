@@ -847,6 +847,7 @@ mod tests {
             path: "/xhttp".to_string(),
             headers: std::collections::HashMap::new(),
             extra: None,
+            ..Default::default()
         });
         let ws_cfg = TransportConfig::WebSocket(WebSocketTransportConfig {
             path: "/ws".to_string(),

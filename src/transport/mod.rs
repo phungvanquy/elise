@@ -22,7 +22,7 @@ pub use types::{
     TlsServerConfig, TransportConfig, TransportSecurityConfig, TransportType,
 };
 pub use websocket::apply_websocket_transport;
-pub use xhttp::apply_xhttp_transport;
+pub use xhttp::serve_xhttp;
 
 pub async fn apply_transport(
     stream: BoxedStream,
@@ -33,7 +33,10 @@ pub async fn apply_transport(
         TransportConfig::WebSocket(cfg) => apply_websocket_transport(stream, cfg).await,
         TransportConfig::Grpc(cfg) => apply_grpc_transport(stream, cfg).await,
         TransportConfig::HttpUpgrade(cfg) => apply_httpupgrade_transport(stream, cfg).await,
-        TransportConfig::XHttp(cfg) => apply_xhttp_transport(stream, cfg).await,
+        TransportConfig::XHttp(_) => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "XHTTP requires serve_transport to handle split and multiplexed requests",
+        )),
         TransportConfig::LegacyHttp2(cfg) => apply_h2_transport(stream, cfg).await,
         TransportConfig::MKcp(_) => Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -55,6 +58,7 @@ where
     match transport_cfg {
         TransportConfig::Grpc(cfg) => serve_grpc(stream, cfg, handler).await,
         TransportConfig::LegacyHttp2(cfg) => serve_h2(stream, cfg, tls_manager, handler).await,
+        TransportConfig::XHttp(cfg) => serve_xhttp(stream, cfg, handler).await,
         _ => {
             let mut handler = handler;
             let s = apply_transport(stream, transport_cfg).await?;

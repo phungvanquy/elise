@@ -19,6 +19,9 @@ blake3 = { version = "1.8", features = ["traits-preview"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 h2 = "0.4"
 http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 prost = "0.14"
 anyhow = "1"
 kcp = "0.6"
@@ -78,6 +81,10 @@ redis = { version = "0.26", optional = true, features = ["tokio-comp", "connecti
 quinn = { version = "0.11", optional = true }
 instant-acme = { version = "0.8", default-features = false, features = ["hyper-rustls", "ring", "rcgen", "x509-parser"] }
 x509-parser = { version = "0.18", default-features = false }
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["http2"] }
+tokio = { version = "1.38", features = ["test-util"] }
 
 [features]
 default = ["distributed", "quic-protocols"]
