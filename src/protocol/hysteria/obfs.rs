@@ -1,9 +1,9 @@
 use parking_lot::Mutex;
-use rand::RngCore;
+use rand::{Rng, RngCore};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 const BLAKE2B_IV: [u64; 8] = [
@@ -210,6 +210,9 @@ impl SalamanderObfs {
 
 const GECKO_FRAGMENT_FLAG: u8 = 0x80;
 const GECKO_HEADER_LEN: usize = 5;
+const GECKO_MAX_REASSEMBLY: usize = 1024;
+const GECKO_MAX_PER_SOURCE: usize = 8;
+const GECKO_MAX_PACKET_SIZE: usize = 65535;
 
 #[derive(Debug, Clone)]
 struct GeckoReassemblyEntry {
@@ -217,29 +220,35 @@ struct GeckoReassemblyEntry {
     received: usize,
     total: u8,
     deadline: Instant,
+    bytes: usize,
 }
 
 #[derive(Debug)]
 pub struct GeckoObfs {
     salamander: SalamanderObfs,
-    #[allow(dead_code)]
     min_packet_size: usize,
-    #[allow(dead_code)]
     max_packet_size: usize,
-    #[allow(dead_code)]
     msg_id_counter: AtomicU32,
     reassembly: Mutex<HashMap<(SocketAddr, u8), GeckoReassemblyEntry>>,
 }
 
 impl GeckoObfs {
-    pub fn new(password: &str, min_size: usize, max_size: usize) -> Self {
-        Self {
+    pub fn new(password: &str, min_size: usize, max_size: usize) -> std::io::Result<Self> {
+        let min_size = if min_size == 0 { 512 } else { min_size };
+        let max_size = if max_size == 0 { 1200 } else { max_size };
+        if password.is_empty() || min_size > max_size || max_size > 2048 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Invalid Gecko password or packet sizes",
+            ));
+        }
+        Ok(Self {
             salamander: SalamanderObfs::new(password),
-            min_packet_size: min_size.max(256),
-            max_packet_size: max_size.min(2048).max(512),
+            min_packet_size: min_size,
+            max_packet_size: max_size,
             msg_id_counter: AtomicU32::new(1),
             reassembly: Mutex::new(HashMap::new()),
-        }
+        })
     }
 
     pub fn min_packet_size(&self) -> usize {
@@ -250,8 +259,46 @@ impl GeckoObfs {
         self.max_packet_size
     }
 
-    pub fn obfuscate(&self, payload: &[u8], out: &mut Vec<u8>) {
-        self.salamander.obfuscate(payload, out);
+    pub fn obfuscate(&self, payload: &[u8]) -> Vec<Vec<u8>> {
+        if payload
+            .first()
+            .is_none_or(|byte| byte & GECKO_FRAGMENT_FLAG == 0)
+        {
+            let mut out = Vec::new();
+            self.salamander.obfuscate(payload, &mut out);
+            return vec![out];
+        }
+        let mut rng = rand::thread_rng();
+        let count = rng.gen_range(2..=8);
+        let chunk_size = payload.len() / count;
+        let msg_id = self.msg_id_counter.fetch_add(1, Ordering::Relaxed) as u8;
+        let mut packets = Vec::with_capacity(count);
+        for i in 0..count {
+            let end = if i + 1 == count {
+                payload.len()
+            } else {
+                (i + 1) * chunk_size
+            };
+            let chunk = &payload[i * chunk_size..end];
+            let base = SalamanderObfs::SALT_LEN + GECKO_HEADER_LEN + chunk.len();
+            let low = self.min_packet_size.max(base);
+            let padding = if low <= self.max_packet_size {
+                rng.gen_range(low..=self.max_packet_size) - base
+            } else {
+                0
+            };
+            let mut frame = vec![0u8; GECKO_HEADER_LEN + padding];
+            frame[0] = GECKO_FRAGMENT_FLAG;
+            frame[1] = msg_id;
+            frame[2] = ((i as u8) << 4) | count as u8;
+            frame[3..5].copy_from_slice(&(padding as u16).to_be_bytes());
+            rng.fill_bytes(&mut frame[GECKO_HEADER_LEN..]);
+            frame.extend_from_slice(chunk);
+            let mut wire = Vec::new();
+            self.salamander.obfuscate(&frame, &mut wire);
+            packets.push(wire);
+        }
+        packets
     }
 
     pub fn deobfuscate(&self, wire: &[u8], remote: SocketAddr, out: &mut Vec<u8>) -> bool {
@@ -277,24 +324,33 @@ impl GeckoObfs {
         let pad_len = u16::from_be_bytes([inner[3], inner[4]]) as usize;
         let data_offset = GECKO_HEADER_LEN + pad_len;
 
-        if total_chunks == 0 || chunk_idx >= total_chunks || inner.len() < data_offset {
+        if !(2..=8).contains(&total_chunks)
+            || chunk_idx >= total_chunks
+            || inner.len() < data_offset
+        {
             return false;
         }
         let chunk_data = inner[data_offset..].to_vec();
 
         let mut lock = self.reassembly.lock();
 
-        if lock.len() > 1024 {
-            let now = Instant::now();
-            lock.retain(|_, v| v.deadline > now);
-        }
+        let now = Instant::now();
+        lock.retain(|_, v| v.deadline > now);
 
         let key = (remote, msg_id);
+        if !lock.contains_key(&key)
+            && (lock.len() >= GECKO_MAX_REASSEMBLY
+                || lock.keys().filter(|(source, _)| *source == remote).count()
+                    >= GECKO_MAX_PER_SOURCE)
+        {
+            return false;
+        }
         let entry = lock.entry(key).or_insert_with(|| GeckoReassemblyEntry {
             chunks: vec![None; total_chunks],
             received: 0,
             total: total_chunks as u8,
-            deadline: Instant::now() + Duration::from_secs(8),
+            deadline: now + Duration::from_secs(8),
+            bytes: 0,
         });
 
         if entry.total as usize != total_chunks || chunk_idx >= entry.chunks.len() {
@@ -302,6 +358,11 @@ impl GeckoObfs {
         }
 
         if entry.chunks[chunk_idx].is_none() {
+            if chunk_data.len() > GECKO_MAX_PACKET_SIZE - entry.bytes {
+                lock.remove(&key);
+                return false;
+            }
+            entry.bytes += chunk_data.len();
             entry.chunks[chunk_idx] = Some(chunk_data);
             entry.received += 1;
         }
@@ -328,16 +389,18 @@ pub enum HysteriaObfuscator {
 }
 
 impl HysteriaObfuscator {
-    pub fn obfuscate(&self, payload: &[u8], out: &mut Vec<u8>) {
+    pub fn obfuscate(&self, payload: &[u8]) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
         match self {
             Self::None => {
                 out.clear();
                 out.extend_from_slice(payload);
             }
-            Self::XPlus(x) => x.obfuscate(payload, out),
-            Self::Salamander(s) => s.obfuscate(payload, out),
-            Self::Gecko(g) => g.obfuscate(payload, out),
+            Self::XPlus(x) => x.obfuscate(payload, &mut out),
+            Self::Salamander(s) => s.obfuscate(payload, &mut out),
+            Self::Gecko(g) => return g.obfuscate(payload),
         }
+        vec![out]
     }
 
     pub fn deobfuscate(&self, wire: &[u8], remote: SocketAddr, out: &mut Vec<u8>) -> bool {
@@ -357,6 +420,90 @@ impl HysteriaObfuscator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gecko_sends_long_headers_as_padded_fragment_datagrams() {
+        let gecko = GeckoObfs::new("fixture", 512, 1200).unwrap();
+        let salamander = SalamanderObfs::new("fixture");
+        let mut payload = vec![0x42; 1200];
+        payload[0] = 0xc0;
+        let packets = gecko.obfuscate(&payload);
+        assert!((2..=8).contains(&packets.len()));
+        let mut assembled = Vec::new();
+        let mut msg_id = None;
+        for (index, packet) in packets.iter().enumerate() {
+            assert!((512..=1200).contains(&packet.len()));
+            let mut frame = Vec::new();
+            assert!(salamander.deobfuscate(packet, &mut frame));
+            assert_eq!(frame[0], 0x80);
+            assert_eq!(*msg_id.get_or_insert(frame[1]), frame[1]);
+            assert_eq!(frame[2] >> 4, index as u8);
+            assert_eq!(frame[2] & 15, packets.len() as u8);
+            let padding = u16::from_be_bytes([frame[3], frame[4]]) as usize;
+            assembled.extend_from_slice(&frame[5 + padding..]);
+        }
+        assert_eq!(assembled, payload);
+
+        let packets = gecko.obfuscate(b"\x40short-header");
+        assert_eq!(packets.len(), 1);
+        let mut plain = Vec::new();
+        assert!(salamander.deobfuscate(&packets[0], &mut plain));
+        assert_eq!(plain, b"\x40short-header");
+    }
+
+    #[test]
+    fn gecko_receives_wire_fragments_with_peer_isolation_and_duplicates() {
+        let gecko = GeckoObfs::new("fixture", 512, 1200).unwrap();
+        let salamander = SalamanderObfs::new("fixture");
+        let peer = "127.0.0.1:5000".parse().unwrap();
+        let other = "127.0.0.1:5001".parse().unwrap();
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        // Independent fixtures following upstream's five-byte frame layout.
+        salamander.obfuscate(b"\x80\x17\x02\x00\x02pp\xc0hello", &mut first);
+        salamander.obfuscate(b"\x80\x17\x12\x00\x01pworld", &mut second);
+        let mut out = Vec::new();
+        assert!(!gecko.deobfuscate(&second, peer, &mut out));
+        assert!(!gecko.deobfuscate(&second, peer, &mut out));
+        assert!(!gecko.deobfuscate(&first, other, &mut out));
+        assert!(gecko.deobfuscate(&first, peer, &mut out));
+        assert_eq!(out, b"\xc0helloworld");
+        assert!(gecko.deobfuscate(&second, other, &mut out));
+        assert_eq!(out, b"\xc0helloworld");
+    }
+
+    #[test]
+    fn gecko_rejects_invalid_frames_and_bounds_incomplete_reassembly() {
+        let gecko = GeckoObfs::new("fixture", 512, 1200).unwrap();
+        let salamander = SalamanderObfs::new("fixture");
+        let peer = "127.0.0.1:5000".parse().unwrap();
+        let mut out = Vec::new();
+        let mut wire = Vec::new();
+        for frame in [
+            &b"\x80"[..],
+            &b"\x80\x01\x01\x00\x00"[..],
+            &b"\x80\x01\x09\x00\x00"[..],
+            &b"\x80\x01\x22\x00\x00"[..],
+            &b"\x80\x01\x02\xff\xff"[..],
+        ] {
+            salamander.obfuscate(frame, &mut wire);
+            assert!(!gecko.deobfuscate(&wire, peer, &mut out));
+        }
+        assert!(gecko.reassembly.lock().is_empty());
+        for id in 0..20 {
+            salamander.obfuscate(&[0x80, id, 0x02, 0, 0, 0xc0], &mut wire);
+            assert!(!gecko.deobfuscate(&wire, peer, &mut out));
+        }
+        assert_eq!(gecko.reassembly.lock().len(), GECKO_MAX_PER_SOURCE);
+        for entry in gecko.reassembly.lock().values_mut() {
+            entry.deadline = Instant::now() - Duration::from_secs(1);
+        }
+        assert!(!gecko.deobfuscate(&wire, peer, &mut out));
+        assert_eq!(gecko.reassembly.lock().len(), 1);
+        assert!(GeckoObfs::new("fixture", 1200, 512).is_err());
+        assert!(GeckoObfs::new("fixture", 512, 2049).is_err());
+        assert!(GeckoObfs::new("", 512, 1200).is_err());
+    }
 
     #[test]
     fn test_blake2b_256_golden_vector() {

@@ -25,6 +25,15 @@ use tracing::{debug, info};
 
 pub const HYSTERIA2_TCP_FRAME_TYPE: u64 = 0x401;
 
+#[derive(Default)]
+struct Hy2AuthState {
+    done: Notify,
+    ok: AtomicBool,
+    user: Mutex<Option<User>>,
+    // Keep every authenticated user's device occupied until child streams stop.
+    device_guards: Mutex<HashMap<u32, crate::limiter::device::DeviceGuard>>,
+}
+
 struct Hy2ReassemblyEntry {
     fragments: Vec<Option<Vec<u8>>>,
     received_count: usize,
@@ -186,7 +195,9 @@ impl Inbound for Hysteria2Inbound {
                     map.insert(pass.clone(), u.clone());
                 }
             }
-            map.insert(u.uuid.clone(), u);
+            if !u.uuid.is_empty() {
+                map.insert(u.uuid.clone(), u);
+            }
         }
         *self.users.write() = map;
     }
@@ -249,7 +260,7 @@ impl Inbound for Hysteria2Inbound {
 
         let obfs = match (obfs_type.to_ascii_lowercase().as_str(), pw) {
             ("gecko", Some(p)) if !p.is_empty() => {
-                HysteriaObfuscator::Gecko(GeckoObfs::new(p, min_pkt, max_pkt))
+                HysteriaObfuscator::Gecko(GeckoObfs::new(p, min_pkt, max_pkt)?)
             }
             ("salamander", Some(p)) if !p.is_empty() => {
                 HysteriaObfuscator::Salamander(SalamanderObfs::new(p))
@@ -364,11 +375,7 @@ async fn handle_hy2_connection(
         while tasks.join_next().await.is_some() {}
     });
 
-    let auth_done = Arc::new(Notify::new());
-    let auth_ok = Arc::new(AtomicBool::new(false));
-    // Reauthentication must not release a user whose child streams still run.
-    let mut device_guards = HashMap::new();
-    let authenticated_user: Arc<Mutex<Option<User>>> = Arc::new(Mutex::new(None));
+    let auth = Arc::new(Hy2AuthState::default());
 
     let udp_sessions: Arc<Mutex<HashMap<u32, mpsc::Sender<(String, Vec<u8>)>>>> =
         Arc::new(Mutex::new(HashMap::new()));
@@ -379,8 +386,7 @@ async fn handle_hy2_connection(
     let dg_defrag = defragmenter.clone();
     let dg_cancel = conn_cancel.clone();
     let dg_ctx = ctx.clone();
-    let dg_auth_user = authenticated_user.clone();
-    let dg_auth_ok = auth_ok.clone();
+    let dg_auth = auth.clone();
     let dg_remote = remote_addr;
     let dg_global_cancel = global_cancel.clone();
 
@@ -397,10 +403,10 @@ async fn handle_hy2_connection(
                     let Ok(raw) = dg_res else { break; };
                     if raw.len() < 8 { continue; }
 
-                    if !dg_auth_ok.load(Ordering::Acquire) {
+                    if !dg_auth.ok.load(Ordering::Acquire) {
                         continue;
                     }
-                    let user = match dg_auth_user.lock().clone() {
+                    let user = match dg_auth.user.lock().clone() {
                         Some(u) => u,
                         None => continue,
                     };
@@ -476,173 +482,207 @@ async fn handle_hy2_connection(
             _ = conn_cancel.cancelled() => break Ok(()),
             _ = global_cancel.cancelled() => break Ok(()),
             bi_res = conn.accept_bi() => {
-                let Ok((mut send, mut recv)) = bi_res else { break Ok(()); };
+                let Ok((send, recv)) = bi_res else { break Ok(()); };
 
-                let first_varint = match read_quic_varint_async(&mut recv).await {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-
-                if first_varint == HYSTERIA2_TCP_FRAME_TYPE {
-
-                    let a_ok = auth_ok.clone();
-                    let a_done = auth_done.clone();
-                    let a_user = authenticated_user.clone();
-                    let c_ctx = ctx.clone();
-                    let c_remote = remote_addr;
-
-                    tasks.spawn(async move {
-
-                        let notified = a_done.notified();
-                        tokio::pin!(notified);
-                        notified.as_mut().enable();
-                        if !a_ok.load(Ordering::Acquire) {
-                            let wait_res = tokio::time::timeout(Duration::from_secs(10), notified).await;
-                            if wait_res.is_err() || !a_ok.load(Ordering::Acquire) {
-                                let _ = send.finish();
-                                return;
-                            }
-                        }
-
-                        let user = match a_user.lock().clone() {
-                            Some(u) => u,
-                            None => {
-                                let _ = send.finish();
-                                return;
-                            }
-                        };
-
-                        let addr_len = match read_quic_varint_async(&mut recv).await {
-                            Ok(al) => al as usize,
-                            Err(_) => return,
-                        };
-                        if addr_len > 2048 {
-                            let _ = send.finish();
-                            return;
-                        }
-
-                        let mut addr_bytes = vec![0u8; addr_len];
-                        if recv.read_exact(&mut addr_bytes).await.is_err() {
-                            let _ = send.finish();
-                            return;
-                        }
-                        let target_addr = String::from_utf8_lossy(&addr_bytes).to_string();
-
-                        let pad_len = match read_quic_varint_async(&mut recv).await {
-                            Ok(pl) => pl as usize,
-                            Err(_) => return,
-                        };
-                        if pad_len > 4096 {
-                            let _ = send.finish();
-                            return;
-                        }
-                        if pad_len > 0 {
-                            let mut pad = vec![0u8; pad_len];
-                            let _ = recv.read_exact(&mut pad).await;
-                        }
-
-                        let (host, port) = parse_host_port(&target_addr);
-                        let _ = handle_hy2_tcp_stream(
-                            recv,
-                            send,
-                            c_ctx,
-                            user,
-                            c_remote,
-                            host,
-                            port,
-                        ).await;
-                    });
-                } else {
-
-                    let frame_type = first_varint;
-                    let frame_len = match read_quic_varint_async(&mut recv).await {
-                        Ok(fl) => fl as usize,
-                        Err(_) => continue,
-                    };
-
-                    if frame_len > 65536 {
-                        continue;
+                // Each stream must parse independently: a partial varint or
+                // HEADERS frame must not hold up /auth on another stream.
+                let conn = conn.clone();
+                let users = users.clone();
+                let ctx = ctx.clone();
+                let auth = auth.clone();
+                let stream_cancel = conn_cancel.clone();
+                tasks.spawn(async move {
+                    tokio::select! {
+                        _ = stream_cancel.cancelled() => {},
+                        _ = handle_hy2_stream(conn, send, recv, users, ctx, auth, server_recv_bps) => {},
                     }
-
-                    let mut payload = vec![0u8; frame_len];
-                    if recv.read_exact(&mut payload).await.is_err() {
-                        continue;
-                    }
-
-                    if frame_type == H3_FRAME_SETTINGS {
-                        continue;
-                    } else if frame_type == H3_FRAME_HEADERS {
-                        let parsed_req = parse_qpack_headers(&payload);
-                        let req = match parsed_req {
-                            Ok(r) => r,
-                            Err(_) => {
-                                send_masquerade_404(&mut send, &conn).await;
-                                continue;
-                            }
-                        };
-
-                        let method = req.method.to_uppercase();
-                        let path = &req.path;
-
-                        if method != "POST" || path != "/auth" {
-                            debug!("Hysteria v2 invalid HTTP/3 request: method={}, path={}, host={}", method, path, req.host());
-                            send_masquerade_404(&mut send, &conn).await;
-                            continue;
-                        }
-
-                        let auth_str = req.get_header(HYSTERIA_AUTH_HEADER).unwrap_or("");
-                        let matched_user = users.read().get(auth_str).cloned();
-
-                        let user = match matched_user {
-                            Some(u) => {
-                                ctx.defense.record_success(client_ip);
-                                u
-                            }
-                            None => {
-                                ctx.defense.record_failure(client_ip);
-                                send_masquerade_404(&mut send, &conn).await;
-                                continue;
-                            }
-                        };
-
-                        let Some(guard) = ctx.device_limiter.try_acquire_async(user.id, client_ip).await else {
-                            conn.close(1u32.into(), b"device limit exceeded");
-                            continue;
-                        };
-                        device_guards.insert(user.id, guard);
-
-                        *authenticated_user.lock() = Some(user);
-                        auth_ok.store(true, Ordering::Release);
-                        auth_done.notify_waiters();
-
-                        let rx_resp = if server_recv_bps > 0 {
-                            server_recv_bps.to_string()
-                        } else {
-                            "auto".to_string()
-                        };
-
-                        let padding = "A".repeat(32);
-                        let resp_headers = [
-                            (HYSTERIA_UDP_HEADER, "true"),
-                            (HYSTERIA_CC_RX_HEADER, rx_resp.as_str()),
-                            (HYSTERIA_PADDING_HEADER, padding.as_str()),
-                        ];
-                        let resp_frame = encode_h3_response(233, &resp_headers);
-                        let _ = send.write_all(&resp_frame).await;
-                        let _ = send.finish();
-                    }
-                }
+                });
             }
         }
     };
     conn_cancel.cancel();
     conn.close(0u32.into(), b"session closed");
     crate::protocol::common::inbound::drain_connections(&mut tasks).await;
-    drop(device_guards);
+    drop(auth);
     result
 }
 
-async fn send_masquerade_404(send: &mut quinn::SendStream, _conn: &quinn::Connection) {
+async fn handle_hy2_stream(
+    conn: quinn::Connection,
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    users: Arc<parking_lot::RwLock<HashMap<String, User>>>,
+    ctx: InboundContext,
+    auth: Arc<Hy2AuthState>,
+    server_recv_bps: u64,
+) {
+    let remote_addr = conn.remote_address();
+    let client_ip = remote_addr.ip();
+
+    let first_varint = match tokio::time::timeout(
+        Duration::from_secs(10),
+        read_quic_varint_async(&mut recv),
+    )
+    .await
+    {
+        Ok(Ok(v)) => v,
+        _ => return,
+    };
+
+    if first_varint == HYSTERIA2_TCP_FRAME_TYPE {
+        let notified = auth.done.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !auth.ok.load(Ordering::Acquire) {
+            let wait_res = tokio::time::timeout(Duration::from_secs(10), notified).await;
+            if wait_res.is_err() || !auth.ok.load(Ordering::Acquire) {
+                let _ = send.finish();
+                return;
+            }
+        }
+
+        let user = match auth.user.lock().clone() {
+            Some(u) => u,
+            None => {
+                let _ = send.finish();
+                return;
+            }
+        };
+
+        let (host, port) =
+            match tokio::time::timeout(Duration::from_secs(10), read_hy2_tcp_target(&mut recv))
+                .await
+            {
+                Ok(Ok(target)) => target,
+                _ => return,
+            };
+        let _ = handle_hy2_tcp_stream(recv, send, ctx, user, remote_addr, host, port).await;
+    } else {
+        let frame_type = first_varint;
+        let payload = match tokio::time::timeout(Duration::from_secs(10), async {
+            let frame_len = read_quic_varint_async(&mut recv).await?;
+            if frame_len > 65536 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "HTTP/3 frame too large",
+                ));
+            }
+            let mut payload = vec![0u8; frame_len as usize];
+            recv.read_exact(&mut payload)
+                .await
+                .map_err(io::Error::other)?;
+            Ok(payload)
+        })
+        .await
+        {
+            Ok(Ok(payload)) => payload,
+            _ => return,
+        };
+
+        if frame_type == H3_FRAME_SETTINGS {
+            return;
+        } else if frame_type == H3_FRAME_HEADERS {
+            let parsed_req = parse_qpack_headers(&payload);
+            let req = match parsed_req {
+                Ok(r) => r,
+                Err(_) => {
+                    send_masquerade_404(&mut send).await;
+                    return;
+                }
+            };
+
+            let method = req.method.to_uppercase();
+            let path = &req.path;
+
+            if method != "POST" || path != "/auth" {
+                debug!(
+                    "Hysteria v2 invalid HTTP/3 request: method={}, path={}, host={}",
+                    method,
+                    path,
+                    req.host()
+                );
+                send_masquerade_404(&mut send).await;
+                return;
+            }
+
+            let auth_str = req.get_header(HYSTERIA_AUTH_HEADER).unwrap_or("");
+            let matched_user = if auth_str.is_empty() {
+                None
+            } else {
+                users.read().get(auth_str).cloned()
+            };
+
+            let user = match matched_user {
+                Some(u) => {
+                    ctx.defense.record_success(client_ip);
+                    u
+                }
+                None => {
+                    ctx.defense.record_failure(client_ip);
+                    send_masquerade_404(&mut send).await;
+                    return;
+                }
+            };
+
+            let Some(guard) = ctx
+                .device_limiter
+                .try_acquire_async(user.id, client_ip)
+                .await
+            else {
+                conn.close(1u32.into(), b"device limit exceeded");
+                return;
+            };
+            auth.device_guards.lock().insert(user.id, guard);
+
+            *auth.user.lock() = Some(user);
+            auth.ok.store(true, Ordering::Release);
+            auth.done.notify_waiters();
+
+            let rx_resp = if server_recv_bps > 0 {
+                server_recv_bps.to_string()
+            } else {
+                "auto".to_string()
+            };
+
+            let padding = "A".repeat(32);
+            let resp_headers = [
+                (HYSTERIA_UDP_HEADER, "true"),
+                (HYSTERIA_CC_RX_HEADER, rx_resp.as_str()),
+                (HYSTERIA_PADDING_HEADER, padding.as_str()),
+            ];
+            let resp_frame = encode_h3_response(233, &resp_headers);
+            let _ = send.write_all(&resp_frame).await;
+            let _ = send.finish();
+        }
+    }
+}
+
+async fn read_hy2_tcp_target<R: tokio::io::AsyncRead + Unpin>(
+    recv: &mut R,
+) -> io::Result<(String, u16)> {
+    use tokio::io::AsyncReadExt;
+    let addr_len = read_quic_varint_async(recv).await?;
+    if addr_len > 2048 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "TCP address too long",
+        ));
+    }
+    let mut addr = vec![0u8; addr_len as usize];
+    recv.read_exact(&mut addr).await?;
+    let pad_len = read_quic_varint_async(recv).await?;
+    if pad_len > 4096 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "TCP padding too long",
+        ));
+    }
+    let mut padding = vec![0u8; pad_len as usize];
+    recv.read_exact(&mut padding).await?;
+    Ok(parse_host_port(&String::from_utf8_lossy(&addr)))
+}
+
+async fn send_masquerade_404(send: &mut quinn::SendStream) {
     let headers = [
         ("content-type", "text/html; charset=utf-8"),
         ("server", "nginx"),
@@ -896,6 +936,202 @@ pub fn read_quic_varint_sync<R: io::Read>(reader: &mut R) -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hy2_user_updates_never_register_empty_credentials() {
+        let inbound = Hysteria2Inbound::new();
+        inbound.update_users(vec![
+            User {
+                id: 1,
+                password: Some("password-only".into()),
+                ..Default::default()
+            },
+            User {
+                id: 2,
+                ..Default::default()
+            },
+            User {
+                id: 3,
+                uuid: "uuid".into(),
+                password: Some("password".into()),
+                ..Default::default()
+            },
+        ]);
+        let users = inbound.users.read();
+        assert!(!users.contains_key(""));
+        assert_eq!(users.get("password-only").unwrap().id, 1);
+        assert_eq!(users.get("uuid").unwrap().id, 3);
+        assert_eq!(users.get("password").unwrap().id, 3);
+        drop(users);
+        inbound.update_users(Vec::new());
+        assert!(inbound.users.read().is_empty());
+    }
+
+    #[tokio::test]
+    async fn hy2_tcp_request_requires_complete_padding() {
+        let mut request = Vec::new();
+        write_quic_varint(&mut request, 12).unwrap();
+        request.extend_from_slice(b"localhost:80");
+        write_quic_varint(&mut request, 2).unwrap();
+        request.push(0);
+        assert!(read_hy2_tcp_target(&mut request.as_slice()).await.is_err());
+        request.push(0);
+        assert_eq!(
+            read_hy2_tcp_target(&mut request.as_slice()).await.unwrap(),
+            ("localhost".into(), 80)
+        );
+    }
+
+    #[tokio::test]
+    async fn hy2_partial_streams_and_malformed_headers_do_not_block_authentication() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.cert.der().clone()],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into(),
+            )
+            .unwrap();
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let server =
+            create_hysteria_endpoint(socket, tls, &[b"h3"], HysteriaObfuscator::None, true)
+                .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let mut tls = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        tls.alpn_protocols = vec![b"h3".to_vec()];
+        let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
+        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(quinn::ClientConfig::new(Arc::new(crypto)));
+
+        let geo = Arc::new(crate::geo::GeoEngine::default());
+        let dialer = Arc::new(crate::proxy::router::OutboundDialer::new(
+            Arc::new(crate::dns::DNSResolver::default()),
+            None,
+            None,
+            false,
+        ));
+        let limiter = Arc::new(crate::limiter::DeviceLimiter::new(60, 32, 128, None));
+        let ctx = InboundContext {
+            ready: None,
+            node_id: 1,
+            listen_addr: "127.0.0.1".into(),
+            port: 0,
+            router: Arc::new(crate::proxy::router::Router::new(
+                Default::default(),
+                dialer,
+                geo.clone(),
+            )),
+            rate_limiter: Arc::new(crate::limiter::RateLimiter::new()),
+            conn_limiter: Arc::new(crate::limiter::ConnectionLimiter::new()),
+            device_limiter: limiter.clone(),
+            audit: Arc::new(crate::security::AuditController::new("", "", geo)),
+            defense: Arc::new(crate::security::AttackDefenseManager::default()),
+            tls_manager: Arc::new(crate::security::TLSManager::new(false, "localhost".into())),
+            audit_logger: Arc::new(crate::observability::AuditLogger::new(None::<&str>)),
+            clickhouse_logger: Arc::new(crate::observability::ClickHouseLogger::new(
+                false,
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                None,
+            )),
+            on_traffic: Arc::new(|_, _, _| {}),
+            global_config: Arc::new(crate::config::GlobalConfig::default()),
+            ip_user_cache: Arc::new(crate::limiter::IpUserCache::new(1, false, "")),
+        };
+        let inbound = Hysteria2Inbound::new();
+        inbound.update_users(vec![User {
+            id: 7,
+            password: Some("fixture".into()),
+            ..Default::default()
+        }]);
+        let users = inbound.users.clone();
+        let cancel = CancellationToken::new();
+        let server_cancel = cancel.clone();
+        let address = server.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            handle_hy2_connection(
+                server.accept().await.unwrap(),
+                users,
+                ctx,
+                NodeInfo::default(),
+                server_cancel,
+            )
+            .await
+            .unwrap();
+        });
+        let conn = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.connect(address, "localhost").unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut partials = Vec::new();
+        for prefix in [
+            &[0x40][..],
+            &[H3_FRAME_HEADERS as u8, 0x40],
+            &[H3_FRAME_HEADERS as u8, 10, 0, 0],
+        ] {
+            let (mut send, recv) = conn.open_bi().await.unwrap();
+            send.write_all(prefix).await.unwrap();
+            partials.push((send, recv));
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        async fn request_status(conn: &quinn::Connection, payload: &[u8]) -> String {
+            let (mut send, mut recv) = conn.open_bi().await.unwrap();
+            let mut frame = Vec::new();
+            write_quic_varint(&mut frame, H3_FRAME_HEADERS).unwrap();
+            write_quic_varint(&mut frame, payload.len() as u64).unwrap();
+            frame.extend_from_slice(payload);
+            send.write_all(&frame).await.unwrap();
+            send.finish().unwrap();
+            let reply = tokio::time::timeout(Duration::from_secs(2), recv.read_to_end(65536))
+                .await
+                .expect("another stream blocked authentication")
+                .unwrap();
+            let mut cursor = Cursor::new(reply.as_slice());
+            assert_eq!(
+                read_quic_varint_sync(&mut cursor).unwrap(),
+                H3_FRAME_HEADERS
+            );
+            let len = read_quic_varint_sync(&mut cursor).unwrap() as usize;
+            let start = cursor.position() as usize;
+            parse_qpack_headers(&reply[start..start + len])
+                .unwrap()
+                .get_header(":status")
+                .unwrap()
+                .to_string()
+        }
+
+        // The original process-aborting allocation probe, sent before auth.
+        let mut malicious = vec![0, 0, 0x50, 0x7f];
+        malicious.extend_from_slice(&[0x81, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x0f]);
+        assert_eq!(request_status(&conn, &malicious).await, "404");
+        let mut auth = b"\x00\x00\xd4\x51\x05/auth".to_vec();
+        assert_eq!(request_status(&conn, &auth).await, "404");
+        auth.extend_from_slice(b"\x27\x06hysteria-auth\x00");
+        assert_eq!(request_status(&conn, &auth).await, "404");
+        assert!(limiter.get_online_devices(7).is_empty());
+        auth.pop();
+        auth.extend_from_slice(b"\x07fixture");
+        assert_eq!(request_status(&conn, &auth).await, "233");
+        assert_eq!(limiter.get_online_devices(7).len(), 1);
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), server_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(limiter.get_online_devices(7).is_empty());
+        drop(partials);
+    }
 
     #[test]
     fn test_hy2_parse_host_port() {

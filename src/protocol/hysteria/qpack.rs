@@ -154,14 +154,23 @@ pub fn decode_huffman(src: &[u8]) -> io::Result<Vec<u8>> {
 }
 
 fn read_qpack_int<R: Read>(reader: &mut R, first_byte: u8, prefix_bits: u8) -> io::Result<usize> {
-    let mask = (1 << prefix_bits) - 1;
+    let mask = ((1u16 << prefix_bits) - 1) as u8;
     let mut val = (first_byte & mask) as usize;
     if val == mask as usize {
         let mut m = 0;
         loop {
             let mut b = [0u8; 1];
             reader.read_exact(&mut b)?;
-            val += ((b[0] & 0x7f) as usize) << m;
+            let digit = (b[0] & 0x7f) as usize;
+            if m >= usize::BITS || digit > (usize::MAX >> m) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "QPACK integer overflow",
+                ));
+            }
+            val = val.checked_add(digit << m).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "QPACK integer overflow")
+            })?;
             m += 7;
             if (b[0] & 0x80) == 0 {
                 break;
@@ -171,23 +180,31 @@ fn read_qpack_int<R: Read>(reader: &mut R, first_byte: u8, prefix_bits: u8) -> i
     Ok(val)
 }
 
-fn read_qpack_string<R: Read>(
-    reader: &mut R,
+fn read_qpack_string(
+    reader: &mut Cursor<&[u8]>,
     first_byte: u8,
     prefix_bits: u8,
 ) -> io::Result<String> {
     let is_huffman = (first_byte & (1 << prefix_bits)) != 0;
     let len = read_qpack_int(reader, first_byte, prefix_bits)?;
 
-    let mut raw = vec![0u8; len];
-    reader.read_exact(&mut raw)?;
-
+    // Validate against bytes already received before allocating. A tiny header
+    // block can otherwise advertise a string large enough to abort the process.
+    let start = reader.position() as usize;
+    if len > reader.get_ref().len() - start {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "Truncated QPACK string",
+        ));
+    }
+    let raw = &reader.get_ref()[start..start + len];
     let bytes = if is_huffman {
-        decode_huffman(&raw)?
+        decode_huffman(raw)?
     } else {
-        raw
+        raw.to_vec()
     };
 
+    reader.set_position((start + len) as u64);
     String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
@@ -354,34 +371,17 @@ pub fn parse_qpack_headers(payload: &[u8]) -> io::Result<Http3Request> {
 
     let mut first = [0u8; 1];
     cursor.read_exact(&mut first)?;
-    let mut _ric = (first[0] & 0xff) as usize;
-    if _ric == 0xff {
-        let mut m = 0;
-        loop {
-            let mut b = [0u8; 1];
-            cursor.read_exact(&mut b)?;
-            _ric += ((b[0] & 0x7f) as usize) << m;
-            m += 7;
-            if (b[0] & 0x80) == 0 {
-                break;
-            }
-        }
-    }
+    let required_insert_count = read_qpack_int(&mut cursor, first[0], 8)?;
 
     let mut s_db = [0u8; 1];
     cursor.read_exact(&mut s_db)?;
-    let mut _db = (s_db[0] & 0x7f) as usize;
-    if _db == 0x7f {
-        let mut m = 0;
-        loop {
-            let mut b = [0u8; 1];
-            cursor.read_exact(&mut b)?;
-            _db += ((b[0] & 0x7f) as usize) << m;
-            m += 7;
-            if (b[0] & 0x80) == 0 {
-                break;
-            }
-        }
+    let delta_base = read_qpack_int(&mut cursor, s_db[0], 7)?;
+    // The server advertises zero dynamic table capacity.
+    if required_insert_count != 0 || delta_base != 0 || s_db[0] & 0x80 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Unsupported QPACK dynamic table",
+        ));
     }
 
     let mut req = Http3Request::default();
@@ -396,26 +396,32 @@ pub fn parse_qpack_headers(payload: &[u8]) -> io::Result<Http3Request> {
         if (byte & 0x80) != 0 {
             let is_static = (byte & 0x40) != 0;
             let idx = read_qpack_int(&mut cursor, byte, 6)?;
-            if is_static && idx < QPACK_STATIC_TABLE.len() {
-                let (name, val) = QPACK_STATIC_TABLE[idx];
-                if name == ":method" {
-                    req.method = val.to_string();
-                } else if name == ":path" {
-                    req.path = val.to_string();
-                } else if name == ":authority" || name == ":host" || name == "host" {
-                    req.authority = val.to_string();
-                } else {
-                    req.headers.push((name.to_string(), val.to_string()));
-                }
+            if !is_static || idx >= QPACK_STATIC_TABLE.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid QPACK index",
+                ));
+            }
+            let (name, val) = QPACK_STATIC_TABLE[idx];
+            if name == ":method" {
+                req.method = val.to_string();
+            } else if name == ":path" {
+                req.path = val.to_string();
+            } else if name == ":authority" || name == ":host" || name == "host" {
+                req.authority = val.to_string();
+            } else {
+                req.headers.push((name.to_string(), val.to_string()));
             }
         } else if (byte & 0x40) != 0 {
             let is_static = (byte & 0x10) != 0;
             let name_idx = read_qpack_int(&mut cursor, byte, 4)?;
-            let name = if is_static && name_idx < QPACK_STATIC_TABLE.len() {
-                QPACK_STATIC_TABLE[name_idx].0.to_string()
-            } else {
-                "unknown".to_string()
-            };
+            if !is_static || name_idx >= QPACK_STATIC_TABLE.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid QPACK name index",
+                ));
+            }
+            let name = QPACK_STATIC_TABLE[name_idx].0.to_string();
 
             let mut len_b = [0u8; 1];
             cursor.read_exact(&mut len_b)?;
@@ -446,7 +452,10 @@ pub fn parse_qpack_headers(payload: &[u8]) -> io::Result<Http3Request> {
                 req.headers.push((name, value));
             }
         } else {
-            break;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Unsupported QPACK field representation",
+            ));
         }
     }
 
@@ -502,6 +511,48 @@ fn write_qpack_literal(out: &mut Vec<u8>, name: &str, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qpack_rejects_impossible_string_lengths_before_allocation() {
+        for size in [128, usize::MAX / 16 + 1, usize::MAX] {
+            for huffman in [false, true] {
+                // Literal value with a static name reference.
+                let mut payload = vec![0, 0, 0x50];
+                write_qpack_int(&mut payload, if huffman { 0x80 } else { 0 }, 7, size);
+                assert!(parse_qpack_headers(&payload).is_err());
+                // Literal name, with or without Huffman encoding.
+                let mut payload = vec![0, 0];
+                write_qpack_int(&mut payload, if huffman { 0x28 } else { 0x20 }, 3, size);
+                assert!(parse_qpack_headers(&payload).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn qpack_rejects_integer_overflow_and_unsupported_references() {
+        for prefix in [
+            vec![0xff],
+            vec![0, 0x7f],
+            vec![0, 0, 0xff],
+            vec![0, 0, 0x50, 0x7f],
+        ] {
+            let mut payload = prefix;
+            payload.extend_from_slice(&[0xff; 20]);
+            payload.push(0);
+            assert!(parse_qpack_headers(&payload).is_err());
+        }
+        for payload in [
+            &[1, 0][..],
+            &[0, 1],
+            &[0, 0x80],
+            &[0, 0, 0x80],
+            &[0, 0, 0xff, 0x24],
+            &[0, 0, 0x40, 0],
+            &[0, 0, 0x10],
+        ] {
+            assert!(parse_qpack_headers(payload).is_err(), "{payload:?}");
+        }
+    }
 
     #[test]
     fn test_quic_varint_roundtrip() {

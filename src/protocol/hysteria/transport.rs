@@ -62,16 +62,17 @@ impl AsyncUdpSocket for ObfsSocket {
         match &*self.obfs {
             HysteriaObfuscator::None => self.sender.try_send(transmit),
             _ => {
-                let mut buf = Vec::new();
-                self.obfs.obfuscate(transmit.contents, &mut buf);
-                let obfs_transmit = quinn::udp::Transmit {
-                    destination: transmit.destination,
-                    ecn: transmit.ecn,
-                    contents: &buf,
-                    segment_size: None,
-                    src_ip: transmit.src_ip,
-                };
-                self.sender.try_send(&obfs_transmit)
+                for buf in self.obfs.obfuscate(transmit.contents) {
+                    let obfs_transmit = quinn::udp::Transmit {
+                        destination: transmit.destination,
+                        ecn: transmit.ecn,
+                        contents: &buf,
+                        segment_size: None,
+                        src_ip: transmit.src_ip,
+                    };
+                    self.sender.try_send(&obfs_transmit)?;
+                }
+                Ok(())
             }
         }
     }

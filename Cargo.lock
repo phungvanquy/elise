@@ -843,7 +843,7 @@ checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
 
 [[package]]
 name = "elise"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm 0.10.3",
@@ -2192,8 +2192,8 @@ version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75e669e5202259b5314d1ea5397316ad400819437857b90861765f24c4cf80a2"
 dependencies = [
+ "aws-lc-rs",
  "pem 3.0.6",
- "ring",
  "rustls-pki-types",
  "time",
  "yasna 0.5.2",

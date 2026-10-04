@@ -1,9 +1,15 @@
+use bytes::Bytes;
+use http::{Method, Request, Response, StatusCode};
+use http_body_util::Full;
+use hyper::body::Incoming;
+use hyper::service::service_fn;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use parking_lot::RwLock;
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tracing::{info, warn};
@@ -106,48 +112,43 @@ impl Http01ChallengeServer {
                         break;
                     }
                     accept_res = listener.accept() => {
-                        let (mut stream, remote_addr) = match accept_res {
+                        let (stream, remote_addr) = match accept_res {
                             Ok(res) => res,
                             Err(_) => continue,
                         };
                         let tokens = tokens_clone.clone();
 
                         tokio::spawn(async move {
-                            let mut buf = [0u8; 2048];
-                            let n = match tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buf)).await {
-                                Ok(Ok(n)) if n > 0 => n,
-                                _ => return,
-                            };
-
-                            let req_str = String::from_utf8_lossy(&buf[..n]);
-                            let first_line = req_str.lines().next().unwrap_or("");
-                            let mut parts = first_line.split_whitespace();
-                            let method = parts.next().unwrap_or("");
-                            let path = parts.next().unwrap_or("");
-
-                            if method == "GET" && path.starts_with("/.well-known/acme-challenge/") {
-                                let token = path.trim_start_matches("/.well-known/acme-challenge/");
-                                let key_auth_opt = tokens.read().get(token).cloned();
-                                if let Some(key_auth) = key_auth_opt {
-                                    info!(
-                                        remote = %remote_addr,
-                                        token = %token,
-                                        "ACME HTTP-01 challenge matched and responded successfully"
-                                    );
-                                    let resp = format!(
-                                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                                        key_auth.len(),
-                                        key_auth
-                                    );
-                                    let _ = stream.write_all(resp.as_bytes()).await;
-                                    let _ = stream.flush().await;
-                                    return;
+                            let service = service_fn(move |request: Request<Incoming>| {
+                                let mut response = Response::new(Full::new(Bytes::new()));
+                                *response.status_mut() = StatusCode::NOT_FOUND;
+                                if request.method() == Method::GET {
+                                    if let Some(token) = request.uri().path().strip_prefix("/.well-known/acme-challenge/") {
+                                        if let Some(key_auth) = tokens.read().get(token).cloned() {
+                                            info!(
+                                                remote = %remote_addr,
+                                                token = %token,
+                                                "ACME HTTP-01 challenge matched"
+                                            );
+                                            *response.status_mut() = StatusCode::OK;
+                                            response.headers_mut().insert(
+                                                http::header::CONTENT_TYPE,
+                                                http::HeaderValue::from_static("text/plain"),
+                                            );
+                                            *response.body_mut() = Full::new(Bytes::from(key_auth));
+                                        }
+                                    }
                                 }
-                            }
-
-                            let not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                            let _ = stream.write_all(not_found.as_bytes()).await;
-                            let _ = stream.flush().await;
+                                async move { Ok::<_, Infallible>(response) }
+                            });
+                            // Parse complete headers across TCP reads, with bounded size and time.
+                            let _ = hyper::server::conn::http1::Builder::new()
+                                .timer(TokioTimer::new())
+                                .header_read_timeout(Duration::from_secs(10))
+                                .max_buf_size(8192)
+                                .keep_alive(false)
+                                .serve_connection(TokioIo::new(stream), service)
+                                .await;
                         });
                     }
                 }
@@ -296,15 +297,7 @@ async fn issue_certificate(config: &AcmeConfig) -> Result<(), String> {
         return Err(format!("ACME order ended in unexpected status: {status:?}"));
     }
 
-    let key_alg = match config.cert_key_length.to_ascii_lowercase().as_str() {
-        "ec-384" | "p384" | "p-384" => &rcgen::PKCS_ECDSA_P384_SHA384,
-        "rsa-2048" | "2048" | "rsa" => &rcgen::PKCS_RSA_SHA256,
-        "rsa-4096" | "4096" => &rcgen::PKCS_RSA_SHA512,
-        _ => &rcgen::PKCS_ECDSA_P256_SHA256,
-    };
-
-    let key_pair = rcgen::KeyPair::generate_for(key_alg)
-        .map_err(|e| format!("Failed to generate private key: {e}"))?;
+    let key_pair = generate_certificate_key(&config.cert_key_length).await?;
 
     let mut params = rcgen::CertificateParams::new(vec![config.domain.clone()])
         .map_err(|e| format!("Failed to create certificate params: {e}"))?;
@@ -356,6 +349,28 @@ async fn issue_certificate(config: &AcmeConfig) -> Result<(), String> {
     );
 
     Ok(())
+}
+
+async fn generate_certificate_key(cert_key_length: &str) -> Result<rcgen::KeyPair, String> {
+    let cert_key_length = cert_key_length.to_ascii_lowercase();
+    // RSA generation is CPU-bound; keep it off the async runtime's worker threads.
+    tokio::task::spawn_blocking(move || {
+        match cert_key_length.as_str() {
+            "ec-384" | "p384" | "p-384" => {
+                rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384)
+            }
+            "rsa-2048" | "2048" | "rsa" => {
+                rcgen::KeyPair::generate_rsa_for(&rcgen::PKCS_RSA_SHA256, rcgen::RsaKeySize::_2048)
+            }
+            "rsa-4096" | "4096" => {
+                rcgen::KeyPair::generate_rsa_for(&rcgen::PKCS_RSA_SHA512, rcgen::RsaKeySize::_4096)
+            }
+            _ => rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256),
+        }
+        .map_err(|e| format!("Failed to generate private key: {e}"))
+    })
+    .await
+    .map_err(|e| format!("Private key generation task failed: {e}"))?
 }
 
 fn validate_certificate_pair(cert: &str, key: &str, domain: &str) -> Result<(), String> {
@@ -566,6 +581,7 @@ mod tests {
     use super::*;
     use rcgen::{CertificateParams, KeyPair};
     use std::fs;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use x509_parser::prelude::FromDer;
 
     fn fixture() -> (PathBuf, AcmeConfig, String, String) {
@@ -681,18 +697,28 @@ mod tests {
         } else {
             vec!["127.0.0.1"]
         } {
-            for (path, expected) in [("fixture", "200 OK"), ("unknown", "404 Not Found")] {
+            for (method, path, expected) in [
+                ("GET", "fixture", "200 OK"),
+                ("GET", "unknown", "404 Not Found"),
+                ("GET", "", "404 Not Found"),
+                ("POST", "fixture", "404 Not Found"),
+                (
+                    "GET",
+                    "/.well-known/acme-challenge/fixture",
+                    "404 Not Found",
+                ),
+            ] {
                 let mut stream = tokio::net::TcpStream::connect((host, address.port()))
                     .await
                     .unwrap();
-                stream.write_all(format!("GET /.well-known/acme-challenge/{path} HTTP/1.1\r\nHost: node.example.com\r\n\r\n").as_bytes()).await.unwrap();
+                stream.write_all(format!("{method} /.well-known/acme-challenge/{path} HTTP/1.1\r\nHost: node.example.com\r\n\r\n").as_bytes()).await.unwrap();
                 let mut reply = String::new();
                 tokio::time::timeout(Duration::from_secs(2), stream.read_to_string(&mut reply))
                     .await
                     .unwrap()
                     .unwrap();
                 assert!(reply.contains(expected));
-                if path == "fixture" {
+                if expected == "200 OK" {
                     assert!(reply.ends_with("fixture.authorization"));
                 }
             }
@@ -708,6 +734,126 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_challenge_waits_for_fragmented_request_line_and_headers() {
+        let listener = bind_http_listener(0).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let responder = Http01ChallengeServer::serve(listener);
+        responder.add_token("fixture".into(), "fixture.authorization".into());
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let headers = format!(
+            "re HTTP/1.1\r\nHost: node.example.com\r\nX-Padding: {}\r\n\r",
+            "x".repeat(4096)
+        );
+        for fragment in ["GET /.well-known/acme-challenge/", "fixtu", &headers] {
+            stream.write_all(fragment.as_bytes()).await.unwrap();
+            // Allow the server to consume each fragment, but require it to wait
+            // for the complete request before deciding whether the token matches.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), stream.read(&mut [0u8; 1]))
+                    .await
+                    .is_err()
+            );
+        }
+        stream.write_all(b"\n").await.unwrap();
+        let mut reply = String::new();
+        tokio::time::timeout(Duration::from_secs(2), stream.read_to_string(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(reply.starts_with("HTTP/1.1 200 OK\r\n"), "{reply}");
+        assert!(reply.ends_with("\r\n\r\nfixture.authorization"), "{reply}");
+        responder.stop();
+    }
+
+    #[tokio::test]
+    async fn http_challenge_rejects_oversized_headers() {
+        let listener = bind_http_listener(0).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let responder = Http01ChallengeServer::serve(listener);
+        responder.add_token("fixture".into(), "fixture.authorization".into());
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let mut request = b"GET /.well-known/acme-challenge/fixture HTTP/1.1\r\nHost: node.example.com\r\nX-Padding: ".to_vec();
+        request.resize(8192, b'x');
+        stream.write_all(&request).await.unwrap();
+        let mut reply = String::new();
+        tokio::time::timeout(Duration::from_secs(2), stream.read_to_string(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(reply.starts_with("HTTP/1.1 431 "), "{reply}");
+        responder.stop();
+    }
+
+    #[tokio::test]
+    async fn http_challenge_incomplete_headers_time_out() {
+        let listener = bind_http_listener(0).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let responder = Http01ChallengeServer::serve(listener);
+        responder.add_token("fixture".into(), "fixture.authorization".into());
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        stream
+            .write_all(b"GET /.well-known/acme-challenge/fixture HTTP/1.1\r\nHost: ")
+            .await
+            .unwrap();
+        let mut reply = String::new();
+        tokio::time::timeout(Duration::from_secs(15), stream.read_to_string(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        // Hyper closes timed-out connections without sending an HTTP response.
+        assert!(reply.is_empty(), "{reply}");
+        responder.stop();
+    }
+
+    #[tokio::test]
+    async fn certificate_keys_have_requested_size_and_valid_csrs() {
+        use ring::signature;
+        use x509_parser::certification_request::X509CertificationRequest;
+
+        for (setting, bits, verifier) in [
+            (
+                "ec-256",
+                256,
+                &signature::ECDSA_P256_SHA256_ASN1 as &dyn signature::VerificationAlgorithm,
+            ),
+            ("ec-384", 384, &signature::ECDSA_P384_SHA384_ASN1),
+            ("p384", 384, &signature::ECDSA_P384_SHA384_ASN1),
+            ("p-384", 384, &signature::ECDSA_P384_SHA384_ASN1),
+            ("rsa-2048", 2048, &signature::RSA_PKCS1_2048_8192_SHA256),
+            ("2048", 2048, &signature::RSA_PKCS1_2048_8192_SHA256),
+            ("rsa", 2048, &signature::RSA_PKCS1_2048_8192_SHA256),
+            ("rsa-4096", 4096, &signature::RSA_PKCS1_2048_8192_SHA512),
+            ("4096", 4096, &signature::RSA_PKCS1_2048_8192_SHA512),
+            ("RSA-4096", 4096, &signature::RSA_PKCS1_2048_8192_SHA512),
+        ] {
+            let key = generate_certificate_key(setting).await.unwrap();
+            let params = CertificateParams::new(vec!["node.example.com".into()]).unwrap();
+            let csr = params.serialize_request(&key).unwrap();
+            let (_, parsed) = X509CertificationRequest::from_der(csr.der()).unwrap();
+            let info = &parsed.certification_request_info;
+            assert_eq!(
+                info.subject_pki.parsed().unwrap().key_size(),
+                bits,
+                "{setting}"
+            );
+            signature::UnparsedPublicKey::new(verifier, &info.subject_pki.subject_public_key.data)
+                .verify(info.raw, &parsed.signature_value.data)
+                .unwrap_or_else(|e| panic!("{setting} CSR signature failed: {e:?}"));
+
+            // The generated PEM pair must also load in the ring-backed TLS server.
+            let cert = params.self_signed(&key).unwrap();
+            validate_certificate_pair(&cert.pem(), &key.serialize_pem(), "node.example.com")
+                .unwrap_or_else(|e| panic!("{setting} certificate/key pair failed: {e}"));
+        }
     }
 
     #[test]
