@@ -622,11 +622,12 @@ impl Connection {
 
                     // Check whether the next datagram is blocked by pacing
                     let smoothed_rtt = self.path.rtt.get();
-                    if let Some(delay) = self.path.pacing.delay(
+                    if let Some(delay) = self.path.pacing.delay_with_rate(
                         smoothed_rtt,
                         bytes_to_send,
                         self.path.current_mtu(),
                         self.path.congestion.window(),
+                        self.path.congestion.pacing_rate(),
                         now,
                     ) {
                         self.timers.set(Timer::Pacing, delay);

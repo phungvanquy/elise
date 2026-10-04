@@ -16,6 +16,7 @@ pub(super) struct Pacer {
     capacity: u64,
     last_window: u64,
     last_mtu: u16,
+    last_rate: Option<u64>,
     tokens: u64,
     prev: Instant,
 }
@@ -28,6 +29,7 @@ impl Pacer {
             capacity,
             last_window: window,
             last_mtu: mtu,
+            last_rate: None,
             tokens: capacity,
             prev: now,
         }
@@ -111,6 +113,46 @@ impl Pacer {
         // this is the time at which the pacing window becomes empty
         Some(self.prev + (unscaled_delay / 5) * 4)
     }
+
+    /// Use a controller's explicit rate independently of its in-flight window.
+    pub(super) fn delay_with_rate(
+        &mut self,
+        smoothed_rtt: Duration,
+        bytes_to_send: u64,
+        mtu: u16,
+        window: u64,
+        rate: Option<u64>,
+        now: Instant,
+    ) -> Option<Instant> {
+        let Some(rate) = rate.filter(|rate| *rate > 0) else {
+            if self.last_rate.take().is_some() {
+                self.capacity = optimal_capacity(smoothed_rtt, window, mtu);
+                self.tokens = self.tokens.min(self.capacity);
+                self.prev = now;
+            }
+            return self.delay(smoothed_rtt, bytes_to_send, mtu, window, now);
+        };
+
+        let elapsed = now.saturating_duration_since(self.prev);
+        let refill = (elapsed.as_secs_f64() * self.last_rate.unwrap_or(rate) as f64) as u64;
+        self.tokens = self.tokens.saturating_add(refill).min(self.capacity);
+        self.prev = now;
+        if self.last_rate != Some(rate) || self.last_mtu != mtu {
+            self.capacity = ((u128::from(rate) * BURST_INTERVAL_NANOS / 1_000_000_000)
+                .min(u128::from(MAX_BURST_SIZE) * u128::from(mtu))
+                as u64)
+                .max(MIN_BURST_SIZE * u64::from(mtu));
+            self.tokens = self.tokens.min(self.capacity);
+            self.last_rate = Some(rate);
+            self.last_mtu = mtu;
+            self.prev = now;
+        }
+        if self.tokens >= bytes_to_send {
+            return None;
+        }
+        let missing = bytes_to_send.max(self.capacity) - self.tokens;
+        Some(now + Duration::from_secs_f64(missing as f64 / rate as f64))
+    }
 }
 
 /// Calculates a pacer capacity for a certain window and RTT
@@ -153,6 +195,72 @@ const MAX_BURST_SIZE: u64 = 256;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_rate_is_independent_of_rtt_and_large_congestion_windows() {
+        let now = Instant::now();
+        let mut pacer = Pacer::new(Duration::from_millis(100), u64::MAX, 1200, now);
+        assert_eq!(
+            pacer.delay_with_rate(
+                Duration::from_millis(100),
+                1200,
+                1200,
+                u64::MAX,
+                Some(1_200_000),
+                now
+            ),
+            None
+        );
+        // Initial credit is ten packets. A huge congestion window must not
+        // bypass an explicit rate, and a two-BDP window must not double it.
+        for _ in 0..10 {
+            pacer.on_transmit(1200);
+        }
+        let resume = pacer
+            .delay_with_rate(
+                Duration::from_millis(1),
+                1200,
+                1200,
+                u64::MAX,
+                Some(1_200_000),
+                now,
+            )
+            .unwrap();
+        assert_eq!(resume - now, Duration::from_millis(10));
+        assert_eq!(
+            pacer.delay_with_rate(
+                Duration::from_millis(1),
+                1200,
+                1200,
+                u64::MAX,
+                Some(1_200_000),
+                resume
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn changing_rates_preserves_elapsed_credit() {
+        let now = Instant::now();
+        let mut pacer = Pacer::new(Duration::from_millis(100), 12000, 1200, now);
+        pacer.delay_with_rate(Duration::ZERO, 1200, 1200, 12000, Some(1_200_000), now);
+        for _ in 0..10 {
+            pacer.on_transmit(1200);
+        }
+        assert_eq!(
+            pacer.delay_with_rate(
+                Duration::ZERO,
+                1200,
+                1200,
+                12000,
+                Some(1_300_000),
+                now + Duration::from_millis(1)
+            ),
+            None
+        );
+        assert_eq!(pacer.tokens, 1200);
+    }
 
     #[test]
     fn does_not_panic_on_bad_instant() {

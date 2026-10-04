@@ -1,5 +1,12 @@
 use serde::{Deserialize, Serialize};
 
+pub(crate) fn ignore_client_bandwidth(data: &serde_json::Value) -> bool {
+    data.get("ignore_client_bandwidth")
+        .or_else(|| data.get("ignoreClientBandwidth"))
+        .and_then(|value| value.as_bool().or_else(|| value.as_u64().map(|n| n != 0)))
+        .unwrap_or(false)
+}
+
 pub(crate) fn speed_limit_bps(value: Option<&serde_json::Value>) -> std::io::Result<u64> {
     let Some(value) = value.filter(|v| !v.is_null()) else {
         return Ok(0);
@@ -61,6 +68,8 @@ pub struct NodeInfo {
     pub up_mbps: Option<u32>,
     #[serde(default)]
     pub down_mbps: Option<u32>,
+    #[serde(default, alias = "ignoreClientBandwidth")]
+    pub ignore_client_bandwidth: bool,
     #[serde(default)]
     pub server_key: Option<String>,
     #[serde(default)]

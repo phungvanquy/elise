@@ -1,6 +1,6 @@
 [package]
 name = "elise"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2021"
 authors = ["Elise Core Team"]
 description = "High-Performance Multi-Protocol Node Backend for Xboard & Modern Panels"
@@ -79,6 +79,7 @@ redis = { version = "0.26", optional = true, features = ["tokio-comp", "connecti
 
 # QUIC for Hysteria2 & TUIC
 quinn = { version = "0.11", optional = true }
+quinn-proto = { version = "0.11", optional = true, default-features = false }
 instant-acme = { version = "0.8", default-features = false, features = ["hyper-rustls", "ring", "rcgen", "x509-parser"] }
 x509-parser = { version = "0.18", default-features = false }
 
@@ -89,7 +90,7 @@ tokio = { version = "1.38", features = ["test-util"] }
 [features]
 default = ["distributed", "quic-protocols"]
 distributed = ["dep:redis"]
-quic-protocols = ["dep:quinn"]
+quic-protocols = ["dep:quinn", "dep:quinn-proto"]
 
 [profile.release]
 opt-level = 3

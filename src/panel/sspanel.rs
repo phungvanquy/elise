@@ -69,6 +69,7 @@ impl SSPanelClient {
                 .and_then(|v| v.as_str())
                 .map(String::from),
             plugin_opts: data.get("plugin_opts").cloned(),
+            ignore_client_bandwidth: super::types::ignore_client_bandwidth(data),
             up_mbps: data
                 .get("up_mbps")
                 .and_then(Value::as_u64)

@@ -89,7 +89,8 @@ impl Datagrams<'_> {
         let limit = self
             .conn
             .peer_params
-            .max_datagram_frame_size?
+            .max_datagram_frame_size
+            .or(self.conn.config.assume_peer_max_datagram_frame_size)?
             .into_inner()
             .saturating_sub(Datagram::SIZE_BOUND as u64);
         Some(limit.min(max_size as u64) as usize)

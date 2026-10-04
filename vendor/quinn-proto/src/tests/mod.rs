@@ -2351,6 +2351,39 @@ fn datagram_recv_buffer_overflow() {
 }
 
 #[test]
+fn datagram_application_negotiated_limit_is_opt_in_and_respects_explicit_limits() {
+    let _guard = subscribe();
+    for (fallback, peer_limit, supported) in [
+        (None, None, false),
+        (Some(1200u32.into()), None, true),
+        (Some(1200u32.into()), Some(0u32.into()), false),
+        (Some(1200u32.into()), Some(100u32.into()), true),
+    ] {
+        let mut pair = Pair::new(Default::default(), ServerConfig {
+            transport: Arc::new(TransportConfig {
+                assume_peer_max_datagram_frame_size: fallback,
+                ..TransportConfig::default()
+            }),
+            ..server_config()
+        });
+        let mut client = client_config();
+        client.transport_config(Arc::new(TransportConfig {
+            // Omit the parameter or advertise an explicit limit. In particular,
+            // an explicit zero must never be overridden by the fallback.
+            datagram_receive_buffer_size: None,
+            max_datagram_frame_size: peer_limit,
+            ..TransportConfig::default()
+        }));
+        let (_, server_ch) = pair.connect_with(client);
+        let size = pair.server_datagrams(server_ch).max_size();
+        assert_eq!(size.is_some_and(|size| size > 0), supported);
+        if let Some(limit) = peer_limit {
+            assert_eq!(size, Some(limit.into_inner().saturating_sub(Datagram::SIZE_BOUND as u64) as usize));
+        }
+    }
+}
+
+#[test]
 fn datagram_send_buffer_overflow() {
     let _guard = subscribe();
     const PAYLOAD_WINDOW: usize = 100;

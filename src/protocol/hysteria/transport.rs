@@ -1,5 +1,6 @@
 pub use super::obfs::HysteriaObfuscator;
 use quinn::{AsyncUdpSocket, Runtime, UdpPoller, VarInt};
+use std::collections::VecDeque;
 use std::io::{self, IoSliceMut};
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -51,6 +52,7 @@ impl AsyncWrite for QuicStream {
 struct ObfsSocket {
     sender: Arc<dyn AsyncUdpSocket>,
     obfs: Arc<HysteriaObfuscator>,
+    received: parking_lot::Mutex<VecDeque<(Vec<u8>, quinn::udp::RecvMeta)>>,
 }
 
 impl AsyncUdpSocket for ObfsSocket {
@@ -83,40 +85,53 @@ impl AsyncUdpSocket for ObfsSocket {
         bufs: &mut [IoSliceMut<'_>],
         meta: &mut [quinn::udp::RecvMeta],
     ) -> Poll<io::Result<usize>> {
-        match self.sender.poll_recv(cx, bufs, meta) {
-            Poll::Ready(Ok(count)) => match &*self.obfs {
-                HysteriaObfuscator::None => Poll::Ready(Ok(count)),
-                _ => {
-                    let mut valid_idx = 0;
-                    let mut temp = Vec::new();
-                    for i in 0..count {
-                        let len = meta[i].len;
-                        let remote = meta[i].addr;
-                        let raw = &bufs[i][..len];
-
-                        if self.obfs.deobfuscate(raw, remote, &mut temp) && !temp.is_empty() {
-                            if temp.len() <= bufs[valid_idx].len() {
-                                bufs[valid_idx][..temp.len()].copy_from_slice(&temp);
-                                meta[valid_idx] = quinn::udp::RecvMeta {
-                                    addr: remote,
-                                    len: temp.len(),
-                                    stride: temp.len(),
-                                    ecn: meta[i].ecn,
-                                    dst_ip: meta[i].dst_ip,
-                                };
-                                valid_idx += 1;
-                            }
-                        }
-                    }
-                    if valid_idx == 0 {
-                        cx.waker().wake_by_ref();
-                        Poll::Pending
-                    } else {
-                        Poll::Ready(Ok(valid_idx))
+        if matches!(&*self.obfs, HysteriaObfuscator::None) {
+            return self.sender.poll_recv(cx, bufs, meta);
+        }
+        let mut received = self.received.lock();
+        if received.is_empty() {
+            let count = match self.sender.poll_recv(cx, bufs, meta) {
+                Poll::Ready(Ok(count)) => count,
+                other => return other,
+            };
+            // The wrapped socket enables UDP GRO. Each coalesced datagram has
+            // its own salt; decrypting the entire buffer corrupts every packet
+            // after the first. Keep at most one receive batch pending, and split
+            // before deobfuscation (Gecko can also complete a larger packet).
+            for i in 0..count {
+                let info = meta[i];
+                for raw in bufs[i][..info.len].chunks(info.stride.max(1)) {
+                    let mut packet = Vec::new();
+                    if self.obfs.deobfuscate(raw, info.addr, &mut packet) && !packet.is_empty() {
+                        let len = packet.len();
+                        received.push_back((
+                            packet,
+                            quinn::udp::RecvMeta {
+                                len,
+                                stride: len,
+                                ..info
+                            },
+                        ));
                     }
                 }
-            },
-            other => other,
+            }
+        }
+        let mut count = 0;
+        while count < bufs.len().min(meta.len()) {
+            let Some((packet, info)) = received.pop_front() else {
+                break;
+            };
+            if packet.len() <= bufs[count].len() {
+                bufs[count][..packet.len()].copy_from_slice(&packet);
+                meta[count] = info;
+                count += 1;
+            }
+        }
+        if count == 0 {
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        } else {
+            Poll::Ready(Ok(count))
         }
     }
 
@@ -139,10 +154,8 @@ impl AsyncUdpSocket for ObfsSocket {
     }
 
     fn max_receive_segments(&self) -> usize {
-        match &*self.obfs {
-            HysteriaObfuscator::None => self.sender.max_receive_segments(),
-            _ => 1,
-        }
+        // Reserve enough space for GRO even when GSO is disabled for obfs.
+        self.sender.max_receive_segments()
     }
 }
 
@@ -153,6 +166,15 @@ pub fn create_hysteria_endpoint(
     obfs: HysteriaObfuscator,
     enable_datagrams: bool,
 ) -> io::Result<quinn::Endpoint> {
+    let server = hysteria_server_config(tls_config, alpn, enable_datagrams)?;
+    create_hysteria_endpoint_with_config(socket, server, obfs)
+}
+
+pub(super) fn hysteria_server_config(
+    tls_config: rustls::ServerConfig,
+    alpn: &[&[u8]],
+    enable_datagrams: bool,
+) -> io::Result<quinn::ServerConfig> {
     let mut tls = tls_config;
     tls.alpn_protocols = alpn.iter().map(|s| s.to_vec()).collect();
     tls.max_early_data_size = 0;
@@ -160,7 +182,11 @@ pub fn create_hysteria_endpoint(
     let crypto =
         quinn::crypto::rustls::QuicServerConfig::try_from(tls).map_err(io::Error::other)?;
     let mut server = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+    server.transport_config(Arc::new(hysteria_transport_config(enable_datagrams)));
+    Ok(server)
+}
 
+pub(super) fn hysteria_transport_config(enable_datagrams: bool) -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
     transport
         .max_concurrent_bidi_streams(VarInt::from_u32(10000))
@@ -179,7 +205,25 @@ pub fn create_hysteria_endpoint(
         transport.datagram_receive_buffer_size(None);
     }
 
-    server.transport_config(Arc::new(transport));
+    transport
+}
+
+pub(super) fn create_hysteria_endpoint_with_config(
+    socket: std::net::UdpSocket,
+    server: quinn::ServerConfig,
+    obfs: HysteriaObfuscator,
+) -> io::Result<quinn::Endpoint> {
+    // Like quic-go, request larger kernel queues for bursty QUIC traffic. OS
+    // limits may clamp these; a tuning failure must not prevent startup.
+    let socket_ref = socket2::SockRef::from(&socket);
+    for result in [
+        socket_ref.set_recv_buffer_size(7 * 1024 * 1024),
+        socket_ref.set_send_buffer_size(7 * 1024 * 1024),
+    ] {
+        if let Err(error) = result {
+            tracing::debug!(%error, "Could not enlarge Hysteria UDP socket buffer");
+        }
+    }
     let runtime = Arc::new(quinn::TokioRuntime);
 
     let endpoint = if matches!(&obfs, HysteriaObfuscator::None) {
@@ -197,6 +241,7 @@ pub fn create_hysteria_endpoint(
             Arc::new(ObfsSocket {
                 sender,
                 obfs: Arc::new(obfs),
+                received: parking_lot::Mutex::default(),
             }),
             runtime,
         )?
@@ -281,4 +326,83 @@ pub fn build_hysteria_tls_config(
     cfg.max_early_data_size = 0;
 
     Ok(cfg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::obfs::SalamanderObfs;
+    use super::*;
+
+    #[derive(Debug)]
+    struct CoalescedSocket {
+        batch: parking_lot::Mutex<Option<(Vec<u8>, quinn::udp::RecvMeta)>>,
+    }
+
+    impl AsyncUdpSocket for CoalescedSocket {
+        fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+            unreachable!()
+        }
+        fn try_send(&self, _: &quinn::udp::Transmit<'_>) -> io::Result<()> {
+            unreachable!()
+        }
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok("127.0.0.1:443".parse().unwrap())
+        }
+        fn max_receive_segments(&self) -> usize {
+            64
+        }
+        fn poll_recv(
+            &self,
+            _: &mut Context<'_>,
+            bufs: &mut [IoSliceMut<'_>],
+            meta: &mut [quinn::udp::RecvMeta],
+        ) -> Poll<io::Result<usize>> {
+            let Some((batch, info)) = self.batch.lock().take() else {
+                return Poll::Pending;
+            };
+            bufs[0][..batch.len()].copy_from_slice(&batch);
+            meta[0] = info;
+            Poll::Ready(Ok(1))
+        }
+    }
+
+    #[test]
+    fn salamander_splits_gro_packets_and_drains_pending_before_reading_again() {
+        let obfs = HysteriaObfuscator::Salamander(SalamanderObfs::new("fixture"));
+        let packets = [vec![1; 64], vec![2; 64], vec![3; 17]];
+        let batch: Vec<u8> = packets
+            .iter()
+            .flat_map(|packet| obfs.obfuscate(packet).concat())
+            .collect();
+        let remote = "127.0.0.1:1234".parse().unwrap();
+        let info = quinn::udp::RecvMeta {
+            addr: remote,
+            len: batch.len(),
+            stride: 72,
+            ecn: None,
+            dst_ip: Some("127.0.0.1".parse().unwrap()),
+        };
+        let socket = ObfsSocket {
+            sender: Arc::new(CoalescedSocket {
+                batch: parking_lot::Mutex::new(Some((batch, info))),
+            }),
+            obfs: Arc::new(obfs),
+            received: parking_lot::Mutex::default(),
+        };
+        assert_eq!(socket.max_receive_segments(), 64);
+        let mut buffer = [0; 4096];
+        let mut meta = [quinn::udp::RecvMeta::default()];
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        for packet in packets {
+            assert!(matches!(
+                socket.poll_recv(&mut cx, &mut [IoSliceMut::new(&mut buffer)], &mut meta),
+                Poll::Ready(Ok(1))
+            ));
+            assert_eq!(meta[0].addr, remote);
+            assert_eq!(meta[0].dst_ip, info.dst_ip);
+            assert_eq!(meta[0].stride, packet.len());
+            assert_eq!(&buffer[..meta[0].len], packet);
+        }
+        assert!(socket.received.lock().is_empty());
+    }
 }

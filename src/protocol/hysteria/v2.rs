@@ -1,10 +1,14 @@
+use super::congestion::Hy2CongestionFactory;
 use super::obfs::{GeckoObfs, HysteriaObfuscator, SalamanderObfs};
 use super::qpack::{
     encode_h3_control_stream, encode_h3_response, parse_qpack_headers, quic_varint_len,
     read_quic_varint_async, write_quic_varint, H3_FRAME_DATA, H3_FRAME_HEADERS, H3_FRAME_SETTINGS,
     HYSTERIA_AUTH_HEADER, HYSTERIA_CC_RX_HEADER, HYSTERIA_PADDING_HEADER, HYSTERIA_UDP_HEADER,
 };
-use super::transport::{build_hysteria_tls_config, create_hysteria_endpoint, QuicStream};
+use super::transport::{
+    build_hysteria_tls_config, create_hysteria_endpoint_with_config, hysteria_server_config,
+    hysteria_transport_config, QuicStream,
+};
 use crate::conn::MonitoredStream;
 use crate::observability::AuditRecord;
 use crate::panel::types::{NodeInfo, User};
@@ -15,7 +19,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::io::{self, Cursor};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
@@ -30,8 +34,50 @@ struct Hy2AuthState {
     done: Notify,
     ok: AtomicBool,
     user: Mutex<Option<User>>,
-    // Keep every authenticated user's device occupied until child streams stop.
-    device_guards: Mutex<HashMap<u32, crate::limiter::device::DeviceGuard>>,
+    authenticate: tokio::sync::Mutex<()>,
+    send_rate: Arc<AtomicU64>,
+    // Hold the authenticated user's device until all child streams stop.
+    device_guard: Mutex<Option<crate::limiter::device::DeviceGuard>>,
+}
+
+#[derive(Clone, Copy)]
+struct Hy2Bandwidth {
+    max_tx: u64,
+    max_rx: u64,
+    ignore_client: bool,
+}
+
+impl Hy2Bandwidth {
+    fn from_node(node: &NodeInfo) -> Self {
+        Self {
+            // Panel directions match V2bX: up is server TX, down is server RX.
+            max_tx: u64::from(node.up_mbps.unwrap_or(0)) * 125_000,
+            max_rx: u64::from(node.down_mbps.unwrap_or(0)) * 125_000,
+            ignore_client: node.ignore_client_bandwidth,
+        }
+    }
+
+    fn negotiated_tx(self, client_rx: Option<&str>) -> u64 {
+        if self.ignore_client {
+            return 0;
+        }
+        let rx = client_rx
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        if self.max_tx > 0 {
+            rx.min(self.max_tx)
+        } else {
+            rx
+        }
+    }
+
+    fn response_rx(self) -> String {
+        if self.ignore_client {
+            "auto".into()
+        } else {
+            self.max_rx.to_string()
+        }
+    }
 }
 
 struct Hy2ReassemblyEntry {
@@ -74,15 +120,16 @@ impl Hy2Defragmenter {
         dest: String,
         data: Vec<u8>,
     ) -> Option<(String, Vec<u8>)> {
+        // Packet ID and Fragment ID are irrelevant for unfragmented messages.
+        if frag_total == 1 {
+            return Some((dest, data));
+        }
         if frag_total == 0 || frag_id >= frag_total {
             debug!(
                 "Hysteria v2 invalid fragment params: total={}, id={}",
                 frag_total, frag_id
             );
             return None;
-        }
-        if frag_total == 1 {
-            return Some((dest, data));
         }
 
         let now = Instant::now();
@@ -271,7 +318,9 @@ impl Inbound for Hysteria2Inbound {
         let alpn = [b"h3".as_slice()];
         let tls_config = build_hysteria_tls_config(&node_info, "hysteria2.local", &alpn)?;
 
-        let endpoint = create_hysteria_endpoint(std_socket, tls_config, &alpn, obfs, true)?;
+        let server_config = hysteria_server_config(tls_config, &alpn, true)?;
+        let endpoint =
+            create_hysteria_endpoint_with_config(std_socket, server_config.clone(), obfs)?;
         info!("Hysteria v2 inbound listening on QUIC {}", bind_addr);
 
         let users = self.users.clone();
@@ -296,9 +345,10 @@ impl Inbound for Hysteria2Inbound {
                     let ctx = ctx.clone();
                     let node_info = node_info.clone();
                     let cancel = cancel_token.clone();
+                    let server_config = server_config.clone();
 
                     connections.spawn(async move {
-                        if let Err(e) = handle_hy2_connection(incoming, users, ctx, node_info, cancel).await {
+                        if let Err(e) = handle_hy2_connection(incoming, users, ctx, node_info, server_config, cancel).await {
                             debug!("Hysteria v2 connection finished: {:?}", e);
                         }
                     });
@@ -318,9 +368,25 @@ async fn handle_hy2_connection(
     users: Arc<parking_lot::RwLock<HashMap<String, User>>>,
     ctx: InboundContext,
     node_info: NodeInfo,
+    mut server_config: quinn::ServerConfig,
     global_cancel: CancellationToken,
 ) -> io::Result<()> {
-    let conn = incoming.await.map_err(io::Error::other)?;
+    let auth = Arc::new(Hy2AuthState::default());
+    let mut transport = hysteria_transport_config(true);
+    // V2bX's Go client deliberately omits this parameter in Chrome mode.
+    // Hysteria negotiates UDP at /auth and fixes its frame limit at 1200 bytes.
+    transport.assume_peer_max_datagram_frame_size(Some(1200u32.into()));
+    transport.congestion_controller_factory(Arc::new(Hy2CongestionFactory {
+        send_rate: auth.send_rate.clone(),
+    }));
+    server_config.transport_config(Arc::new(transport));
+    let connecting = incoming
+        .accept_with(Arc::new(server_config))
+        .map_err(io::Error::other)?;
+    let conn = tokio::select! {
+        _ = global_cancel.cancelled() => return Ok(()),
+        result = connecting => result.map_err(io::Error::other)?,
+    };
     let remote_addr = conn.remote_address();
     let client_ip = remote_addr.ip();
 
@@ -329,8 +395,7 @@ async fn handle_hy2_connection(
         return Ok(());
     }
 
-    let _server_send_bps = node_info.up_mbps.unwrap_or(0) as u64 * 1_000_000;
-    let server_recv_bps = node_info.down_mbps.unwrap_or(0) as u64 * 1_000_000;
+    let bandwidth = Hy2Bandwidth::from_node(&node_info);
 
     let conn_cancel = global_cancel.child_token();
     let _cancel = conn_cancel.clone().drop_guard();
@@ -375,8 +440,6 @@ async fn handle_hy2_connection(
         while tasks.join_next().await.is_some() {}
     });
 
-    let auth = Arc::new(Hy2AuthState::default());
-
     let udp_sessions: Arc<Mutex<HashMap<u32, mpsc::Sender<(String, Vec<u8>)>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let defragmenter = Arc::new(Hy2Defragmenter::new());
@@ -415,6 +478,7 @@ async fn handle_hy2_connection(
                     let packet_id = u16::from_be_bytes(raw[4..6].try_into().unwrap());
                     let frag_id = raw[6];
                     let frag_total = raw[7];
+                    tracing::trace!(session_id, packet_id, frag_id, frag_total, bytes = raw.len(), "Hysteria2 UDP fragment received");
 
                     let mut cursor = Cursor::new(&raw[8..]);
                     let dest_len = match read_quic_varint_sync(&mut cursor) {
@@ -494,7 +558,7 @@ async fn handle_hy2_connection(
                 tasks.spawn(async move {
                     tokio::select! {
                         _ = stream_cancel.cancelled() => {},
-                        _ = handle_hy2_stream(conn, send, recv, users, ctx, auth, server_recv_bps) => {},
+                        _ = handle_hy2_stream(conn, send, recv, users, ctx, auth, bandwidth) => {},
                     }
                 });
             }
@@ -514,7 +578,7 @@ async fn handle_hy2_stream(
     users: Arc<parking_lot::RwLock<HashMap<String, User>>>,
     ctx: InboundContext,
     auth: Arc<Hy2AuthState>,
-    server_recv_bps: u64,
+    bandwidth: Hy2Bandwidth,
 ) {
     let remote_addr = conn.remote_address();
     let client_ip = remote_addr.ip();
@@ -594,7 +658,7 @@ async fn handle_hy2_stream(
             let method = req.method.to_uppercase();
             let path = &req.path;
 
-            if method != "POST" || path != "/auth" {
+            if method != "POST" || path != "/auth" || req.host() != "hysteria" {
                 debug!(
                     "Hysteria v2 invalid HTTP/3 request: method={}, path={}, host={}",
                     method,
@@ -605,44 +669,49 @@ async fn handle_hy2_stream(
                 return;
             }
 
-            let auth_str = req.get_header(HYSTERIA_AUTH_HEADER).unwrap_or("");
-            let matched_user = if auth_str.is_empty() {
-                None
-            } else {
-                users.read().get(auth_str).cloned()
-            };
+            // Auth belongs to the connection. Serialize retries so that another
+            // /auth stream cannot replace its user, device guard, or send rate.
+            let _auth_lock = auth.authenticate.lock().await;
+            if !auth.ok.load(Ordering::Acquire) {
+                let auth_str = req.get_header(HYSTERIA_AUTH_HEADER).unwrap_or("");
+                let matched_user = if auth_str.is_empty() {
+                    None
+                } else {
+                    users.read().get(auth_str).cloned()
+                };
 
-            let user = match matched_user {
-                Some(u) => {
-                    ctx.defense.record_success(client_ip);
-                    u
-                }
-                None => {
-                    ctx.defense.record_failure(client_ip);
-                    send_masquerade_404(&mut send).await;
+                let user = match matched_user {
+                    Some(u) => {
+                        ctx.defense.record_success(client_ip);
+                        u
+                    }
+                    None => {
+                        ctx.defense.record_failure(client_ip);
+                        send_masquerade_404(&mut send).await;
+                        return;
+                    }
+                };
+
+                let Some(guard) = ctx
+                    .device_limiter
+                    .try_acquire_async(user.id, client_ip)
+                    .await
+                else {
+                    conn.close(1u32.into(), b"device limit exceeded");
                     return;
-                }
-            };
+                };
+                *auth.device_guard.lock() = Some(guard);
 
-            let Some(guard) = ctx
-                .device_limiter
-                .try_acquire_async(user.id, client_ip)
-                .await
-            else {
-                conn.close(1u32.into(), b"device limit exceeded");
-                return;
-            };
-            auth.device_guards.lock().insert(user.id, guard);
+                *auth.user.lock() = Some(user);
+                auth.send_rate.store(
+                    bandwidth.negotiated_tx(req.get_header(HYSTERIA_CC_RX_HEADER)),
+                    Ordering::Release,
+                );
+                auth.ok.store(true, Ordering::Release);
+                auth.done.notify_waiters();
+            }
 
-            *auth.user.lock() = Some(user);
-            auth.ok.store(true, Ordering::Release);
-            auth.done.notify_waiters();
-
-            let rx_resp = if server_recv_bps > 0 {
-                server_recv_bps.to_string()
-            } else {
-                "auto".to_string()
-            };
+            let rx_resp = bandwidth.response_rx();
 
             let padding = "A".repeat(32);
             let resp_headers = [
@@ -714,7 +783,13 @@ async fn handle_hy2_tcp_stream(
     let client_ip = remote_addr.ip();
     let target_ip: Option<IpAddr> = target_host.parse().ok();
 
-    let stream = QuicStream::new(recv, send);
+    let mut stream = QuicStream::new(recv, send);
+    let early_response = ctx.global_config.domain_sniff && target_ip.is_some();
+    if early_response {
+        // Non-fast-open clients wait for TCPResponse before sending the bytes
+        // needed by the sniffer. V2bX's RequestHook accepts first for this reason.
+        stream.write_all(&[0, 0, 0]).await?;
+    }
     let (sniffed, stream) =
         crate::conn::sniff_async_stream(stream, target_ip, ctx.global_config.domain_sniff).await;
     let match_host = sniffed.as_deref().unwrap_or(&target_host);
@@ -726,13 +801,15 @@ async fn handle_hy2_tcp_stream(
 
     let mut stream = stream;
     if ctx.audit.should_block(match_host, target_ip, target_port) {
-        let mut resp = Vec::new();
-        resp.push(0x01);
-        let msg = b"blocked by audit rule";
-        let _ = write_quic_varint(&mut resp, msg.len() as u64);
-        resp.extend_from_slice(msg);
-        let _ = write_quic_varint(&mut resp, 0);
-        let _ = stream.write_all(&resp).await;
+        if !early_response {
+            let mut resp = Vec::new();
+            resp.push(0x01);
+            let msg = b"blocked by audit rule";
+            let _ = write_quic_varint(&mut resp, msg.len() as u64);
+            resp.extend_from_slice(msg);
+            let _ = write_quic_varint(&mut resp, 0);
+            let _ = stream.write_all(&resp).await;
+        }
         let _ = stream.shutdown().await;
         return Ok(());
     }
@@ -759,23 +836,23 @@ async fn handle_hy2_tcp_stream(
                 "Hysteria v2 outbound TCP dial failed for {}:{}: {:?}",
                 dial_host, target_port, e
             );
-            let mut resp = Vec::new();
-            resp.push(0x01);
-            let msg = b"connection failed";
-            let _ = write_quic_varint(&mut resp, msg.len() as u64);
-            resp.extend_from_slice(msg);
-            let _ = write_quic_varint(&mut resp, 0);
-            let _ = stream.write_all(&resp).await;
+            if !early_response {
+                let mut resp = Vec::new();
+                resp.push(0x01);
+                let msg = b"connection failed";
+                let _ = write_quic_varint(&mut resp, msg.len() as u64);
+                resp.extend_from_slice(msg);
+                let _ = write_quic_varint(&mut resp, 0);
+                let _ = stream.write_all(&resp).await;
+            }
             let _ = stream.shutdown().await;
             return Ok(());
         }
     };
 
-    let mut ok_resp = Vec::new();
-    ok_resp.push(0x00);
-    let _ = write_quic_varint(&mut ok_resp, 0);
-    let _ = write_quic_varint(&mut ok_resp, 0);
-    stream.write_all(&ok_resp).await?;
+    if !early_response {
+        stream.write_all(&[0, 0, 0]).await?;
+    }
 
     let mut client_conn = MonitoredStream::new(stream, user.id, remote_addr);
     let _traffic = client_conn.traffic_guard(ctx.on_traffic.clone());
@@ -865,7 +942,11 @@ async fn handle_hy2_udp_session(
                     let _ = write_quic_varint(&mut packet, dest_bytes.len() as u64);
                     packet.extend_from_slice(dest_bytes);
                     packet.extend_from_slice(chunk);
-                    if conn.send_datagram(packet.into()).is_err() { sent_all = false; break; }
+                    if let Err(error) = conn.send_datagram(packet.into()) {
+                        debug!(%error, session_id, "Hysteria2 UDP response could not be queued");
+                        sent_all = false;
+                        break;
+                    }
                 }
                 if sent_all {
                     let _ = ack.send(());
@@ -938,6 +1019,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bandwidth_negotiation_matches_v2bx_units_and_unlimited_semantics() {
+        let mut node = NodeInfo {
+            up_mbps: Some(80),
+            down_mbps: Some(16),
+            ..Default::default()
+        };
+        let bandwidth = Hy2Bandwidth::from_node(&node);
+        assert_eq!(bandwidth.response_rx(), "2000000");
+        for (rx, expected) in [
+            (None, 0),
+            (Some("0"), 0),
+            (Some("invalid"), 0),
+            (Some("-1"), 0),
+            (Some("18446744073709551616"), 0),
+            (Some("5000000"), 5_000_000),
+            (Some("20000000"), 10_000_000),
+        ] {
+            assert_eq!(bandwidth.negotiated_tx(rx), expected);
+        }
+        node.up_mbps = None;
+        node.down_mbps = None;
+        let bandwidth = Hy2Bandwidth::from_node(&node);
+        assert_eq!(bandwidth.response_rx(), "0");
+        assert_eq!(bandwidth.negotiated_tx(Some("20000000")), 20_000_000);
+        node.ignore_client_bandwidth = true;
+        let bandwidth = Hy2Bandwidth::from_node(&node);
+        assert_eq!(bandwidth.response_rx(), "auto");
+        assert_eq!(bandwidth.negotiated_tx(Some("20000000")), 0);
+    }
+
+    #[test]
     fn hy2_user_updates_never_register_empty_credentials() {
         let inbound = Hysteria2Inbound::new();
         inbound.update_users(vec![
@@ -995,9 +1107,13 @@ mod tests {
             .unwrap();
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         socket.set_nonblocking(true).unwrap();
-        let server =
-            create_hysteria_endpoint(socket, tls, &[b"h3"], HysteriaObfuscator::None, true)
-                .unwrap();
+        let server_config = hysteria_server_config(tls, &[b"h3"], true).unwrap();
+        let server = create_hysteria_endpoint_with_config(
+            socket,
+            server_config.clone(),
+            HysteriaObfuscator::None,
+        )
+        .unwrap();
         let mut roots = rustls::RootCertStore::empty();
         roots.add(cert.cert.der().clone()).unwrap();
         let mut tls = rustls::ClientConfig::builder()
@@ -1046,11 +1162,18 @@ mod tests {
             ip_user_cache: Arc::new(crate::limiter::IpUserCache::new(1, false, "")),
         };
         let inbound = Hysteria2Inbound::new();
-        inbound.update_users(vec![User {
-            id: 7,
-            password: Some("fixture".into()),
-            ..Default::default()
-        }]);
+        inbound.update_users(vec![
+            User {
+                id: 7,
+                password: Some("fixture".into()),
+                ..Default::default()
+            },
+            User {
+                id: 8,
+                password: Some("another".into()),
+                ..Default::default()
+            },
+        ]);
         let users = inbound.users.clone();
         let cancel = CancellationToken::new();
         let server_cancel = cancel.clone();
@@ -1061,6 +1184,7 @@ mod tests {
                 users,
                 ctx,
                 NodeInfo::default(),
+                server_config,
                 server_cancel,
             )
             .await
@@ -1115,7 +1239,7 @@ mod tests {
         let mut malicious = vec![0, 0, 0x50, 0x7f];
         malicious.extend_from_slice(&[0x81, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x0f]);
         assert_eq!(request_status(&conn, &malicious).await, "404");
-        let mut auth = b"\x00\x00\xd4\x51\x05/auth".to_vec();
+        let mut auth = b"\x00\x00\xd4\x51\x05/auth\x50\x08hysteria".to_vec();
         assert_eq!(request_status(&conn, &auth).await, "404");
         auth.extend_from_slice(b"\x27\x06hysteria-auth\x00");
         assert_eq!(request_status(&conn, &auth).await, "404");
@@ -1124,6 +1248,16 @@ mod tests {
         auth.extend_from_slice(b"\x07fixture");
         assert_eq!(request_status(&conn, &auth).await, "233");
         assert_eq!(limiter.get_online_devices(7).len(), 1);
+        auth.truncate(auth.len() - 7);
+        auth.extend_from_slice(b"another");
+        let (first, second) =
+            tokio::join!(request_status(&conn, &auth), request_status(&conn, &auth));
+        assert_eq!((first.as_str(), second.as_str()), ("233", "233"));
+        assert_eq!(limiter.get_online_devices(7).len(), 1);
+        assert!(
+            limiter.get_online_devices(8).is_empty(),
+            "reauthentication changed the connection's user"
+        );
         cancel.cancel();
         tokio::time::timeout(Duration::from_secs(2), server_task)
             .await
@@ -1170,6 +1304,11 @@ mod tests {
     #[test]
     fn test_hy2_defragmenter_rejections() {
         let defrag = Hy2Defragmenter::new();
+
+        assert_eq!(
+            defrag.push_fragment(1, 1, 255, 1, "8.8.8.8:53".into(), vec![1]),
+            Some(("8.8.8.8:53".into(), vec![1]))
+        );
 
         assert!(defrag
             .push_fragment(1, 1, 0, 0, "8.8.8.8:53".to_string(), vec![1])

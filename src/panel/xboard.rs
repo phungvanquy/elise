@@ -138,6 +138,7 @@ impl XboardClient {
                 .and_then(|v| v.as_str())
                 .map(String::from),
             plugin_opts: data.get("plugin_opts").cloned(),
+            ignore_client_bandwidth: super::types::ignore_client_bandwidth(data),
             up_mbps: data
                 .get("up_mbps")
                 .and_then(|v| v.as_u64())
@@ -545,7 +546,7 @@ mod tests {
                 assert_eq!(query.get("node_id").map(String::as_str), Some("9"));
                 let body = serde_json::json!({"data": {
                     "server_type": reported, "version": version, "server_port": 12345,
-                    "tls": 1, "up_mbps": 100, "down_mbps": 200,
+                    "tls": 1, "up_mbps": 100, "down_mbps": 200, "ignore_client_bandwidth": true,
                     "obfs": "salamander", "obfs_password": "fixture",
                     "padding_scheme": "stop=8"
                 }})
@@ -569,6 +570,7 @@ mod tests {
                 assert_eq!(info.tls, Some(1));
                 assert_eq!(info.up_mbps, Some(100));
                 assert_eq!(info.down_mbps, Some(200));
+                assert!(info.ignore_client_bandwidth);
                 assert_eq!(info.obfs_password.as_deref(), Some("fixture"));
                 assert_eq!(info.padding_scheme, Some(serde_json::json!("stop=8")));
                 assert!(crate::proxy::registry::create_inbound(&info.node_type).is_ok());

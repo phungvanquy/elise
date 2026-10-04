@@ -49,6 +49,7 @@ pub struct TransportConfig {
     pub(crate) datagram_receive_buffer_size: Option<usize>,
     pub(crate) datagram_send_buffer_size: usize,
     pub(crate) max_datagram_frame_size: Option<VarInt>,
+    pub(crate) assume_peer_max_datagram_frame_size: Option<VarInt>,
     #[cfg(test)]
     pub(crate) deterministic_packet_numbers: bool,
 
@@ -302,6 +303,14 @@ impl TransportConfig {
         self
     }
 
+    /// Use an application-negotiated datagram limit when the peer omits the
+    /// transport parameter. Only enable for protocols that require this, such
+    /// as Hysteria 2 clients imitating Chrome's QUIC handshake.
+    pub fn assume_peer_max_datagram_frame_size(&mut self, value: Option<VarInt>) -> &mut Self {
+        self.assume_peer_max_datagram_frame_size = value;
+        self
+    }
+
     /// Maximum number of outgoing application datagram bytes to buffer
     ///
     /// While datagrams are sent ASAP, it is possible for an application to generate data faster
@@ -401,6 +410,7 @@ impl Default for TransportConfig {
             datagram_receive_buffer_size: Some(STREAM_RWND as usize),
             datagram_send_buffer_size: 1024 * 1024,
             max_datagram_frame_size: None,
+            assume_peer_max_datagram_frame_size: None,
             #[cfg(test)]
             deterministic_packet_numbers: false,
 
@@ -438,6 +448,7 @@ impl fmt::Debug for TransportConfig {
             datagram_receive_buffer_size,
             datagram_send_buffer_size,
             max_datagram_frame_size,
+            assume_peer_max_datagram_frame_size,
             #[cfg(test)]
                 deterministic_packet_numbers: _,
             congestion_controller_factory: _,
@@ -471,6 +482,10 @@ impl fmt::Debug for TransportConfig {
             .field("datagram_receive_buffer_size", datagram_receive_buffer_size)
             .field("datagram_send_buffer_size", datagram_send_buffer_size)
             .field("max_datagram_frame_size", max_datagram_frame_size)
+            .field(
+                "assume_peer_max_datagram_frame_size",
+                assume_peer_max_datagram_frame_size,
+            )
             // congestion_controller_factory not debug
             .field("enable_segmentation_offload", enable_segmentation_offload);
         if cfg!(feature = "qlog") {
