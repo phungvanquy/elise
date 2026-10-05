@@ -8,14 +8,14 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test]
-#[ignore = "requires Go and the V2bX Go dependencies"]
+#[ignore = "requires Go and the pinned interoperability fixture dependencies"]
 async fn v2bx_hysteria2_tcp_udp_and_bandwidth_negotiation() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_test_writer()
         .try_init();
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/interop/hysteria2");
     let directory = std::env::temp_dir().join(format!("elise-hy2-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&directory).unwrap();
     struct Cleanup(std::path::PathBuf);
@@ -27,7 +27,7 @@ async fn v2bx_hysteria2_tcp_udp_and_bandwidth_negotiation() {
     let _cleanup = Cleanup(directory.clone());
     let source = directory.join("client.go");
     let executable = directory.join("client");
-    std::fs::write(&source, include_str!("testdata/hysteria2_v2bx.go")).unwrap();
+    std::fs::write(&source, include_str!("interop/hysteria2/client.go")).unwrap();
     let output = tokio::process::Command::new("go")
         .args(["build", "-mod=readonly", "-o"])
         .arg(&executable)

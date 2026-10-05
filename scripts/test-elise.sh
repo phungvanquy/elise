@@ -181,6 +181,7 @@ try:
         })
         service_setup = r'''
 config_dir=$1; shift
+unit_file="$config_dir/systemd/elise@.service"
 binary=/bin/true
 need_root() { :; }
 need_systemd() { :; }
@@ -216,7 +217,7 @@ systemctl() {
                 assert 'certificate renewal' in result.stdout
             assert f'({transport})' in result.stdout and instance in result.stdout
             assert config.stat().st_mode & 0o777 == 0o600
-            assert f'restart V2bX-elise@{instance}.service' in service_log.read_text()
+            assert f'restart elise@{instance}.service' in service_log.read_text()
             run_helper(service_setup + 'remove_node "$1"', config_root, instance, check=True)
             assert not config.parent.exists()
             server.node_listener.close()
@@ -266,7 +267,7 @@ print(os.environ['ELISE_TEST_NODE_INFO'])
         panel_binary.write_text("#!/bin/sh\necho 'error: unrecognized subcommand panel-info' >&2\nexit 2\n")
         result = run_helper(native_setup + 'add_node anytls 9 "$1"', config_root, 'sspanel', panel_binary,
                             input=f'http://127.0.0.1:{server.server_port}\nkey+value\n127.0.0.1\n')
-        assert result.returncode != 0 and 'update the core first' in result.stderr
+        assert result.returncode != 0 and 'run elisectl update' in result.stderr
 
         for domain in ('*.example.com', 'https://node.example.com', '../bad', '127.0.0.1', 'node', '-bad.example.com', 'bad#.example.com'):
             assert run_helper('validate_tls_domain "$1"', domain).returncode != 0, domain

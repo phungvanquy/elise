@@ -1,10 +1,11 @@
 [package]
 name = "elise"
-version = "1.0.3"
+version = "1.0.4"
 edition = "2021"
 authors = ["Elise Core Team"]
 description = "High-Performance Multi-Protocol Node Backend for Xboard & Modern Panels"
 license = "PolyForm-Noncommercial-1.0.0"
+repository = "https://github.com/phungvanquy/elise"
 
 [dependencies]
 # Async Runtime

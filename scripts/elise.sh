@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Elise remains a separate Rust process. The V2bX Go service must not manage
-# the same panel node, or both processes will bind and report it.
-repo="phungvanquy/v2bx-new"
-bin_dir="/usr/local/libexec/V2bX"
+# SPDX-License-Identifier: MPL-2.0
+bin_dir="/usr/local/bin"
 binary="${bin_dir}/elise"
-config_dir="/etc/v2bx-elise"
+config_dir="/etc/elise/instances"
+state_dir="/var/lib/elise"
+support_dir="/usr/local/lib/elise"
 v2bx_config="${V2BX_CONFIG_PATH:-/etc/V2bX/config.json}"
-unit_file="/etc/systemd/system/V2bX-elise@.service"
+unit_file="/etc/systemd/system/elise@.service"
 work=""
 trap '[[ -z "$work" ]] || rm -rf -- "$work"' EXIT
 
-die() { echo "V2bX Elise: $*" >&2; exit 1; }
+die() { echo "Elise: $*" >&2; exit 1; }
 need_root() { [[ $EUID -eq 0 ]] || die "run as root"; }
 need_systemd() { command -v systemctl >/dev/null && [[ -d /run/systemd/system ]] || die "systemd is required"; }
 ensure_python() {
     command -v python3 >/dev/null 2>&1 && return 0
-    echo "V2bX Elise: installing python3" >&2
+    echo "Elise: installing python3" >&2
     if command -v apt-get >/dev/null 2>&1; then
         apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y python3 || die "could not install python3 with apt-get"
     elif command -v dnf >/dev/null 2>&1; then
@@ -31,7 +31,7 @@ ensure_python() {
 }
 ensure_openssl() {
     command -v openssl >/dev/null 2>&1 && return 0
-    echo "V2bX Elise: installing openssl" >&2
+    echo "Elise: installing openssl" >&2
     if command -v apt-get >/dev/null 2>&1; then
         apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y openssl || die "could not install openssl with apt-get"
     elif command -v dnf >/dev/null 2>&1; then
@@ -66,41 +66,7 @@ normalize_panel() {
 }
 valid_instance() { [[ "${1:-}" =~ ^(vless|vmess|anytls|hysteria|hysteria2)-[1-9][0-9]*$ ]]; }
 instance_dir() { printf '%s/%s' "$config_dir" "$1"; }
-instance_unit() { printf 'V2bX-elise@%s.service' "$1"; }
-
-write_unit() {
-    cat > "$unit_file" <<'EOF'
-[Unit]
-Description=V2bX Elise Rust node %i
-After=network-online.target nss-lookup.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=root
-Group=root
-UMask=0077
-WorkingDirectory=/etc/v2bx-elise/%i
-ExecStart=/usr/local/libexec/V2bX/elise run -c /etc/v2bx-elise/%i/elise.conf
-Restart=on-failure
-RestartSec=10
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    chmod 0644 "$unit_file"
-    systemctl daemon-reload
-}
-
-restore_release() {
-    local previous_binary=$1 previous_unit=$2 previous_license=$3 instance
-    if [[ -f "$previous_binary" ]]; then cp -p "$previous_binary" "$binary"; else rm -f -- "$binary"; fi
-    if [[ -f "$previous_unit" ]]; then cp -p "$previous_unit" "$unit_file"; else rm -f -- "$unit_file"; fi
-    if [[ -f "$previous_license" ]]; then cp -p "$previous_license" "$bin_dir/elise.LICENSE"; else rm -f -- "$bin_dir/elise.LICENSE"; fi
-    systemctl daemon-reload || true
-    for instance in "${active[@]}"; do systemctl restart "$(instance_unit "$instance")" || true; done
-}
+instance_unit() { printf 'elise@%s.service' "$1"; }
 
 installed_instances() {
     local file name
@@ -114,88 +80,23 @@ installed_instances() {
 
 install_binary() {
     need_root; need_systemd
-    local arch tag asset archive checksum expected actual old_binary old_unit old_license port listen preflight transport binary_version
-    local -a details
-    case "$(uname -m)" in
-        x86_64|amd64) arch=amd64 ;;
-        aarch64|arm64) arch=arm64 ;;
-        *) die "Elise releases support Linux amd64 and arm64; this host is $(uname -m)" ;;
-    esac
-    ensure_python
-    work=$(mktemp -d /tmp/v2bx-elise.XXXXXX)
-    if [[ -n "${1:-}" ]]; then
-        tag=${1#v}
-        [[ "$tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]] || die "invalid V2bX release version"
-        tag="v$tag"
-        fetch "https://api.github.com/repos/$repo/releases/tags/$tag" "$work/release.json"
-    else
-        fetch "https://api.github.com/repos/$repo/releases/latest" "$work/release.json"
-        tag=$(python3 - "$work/release.json" <<'PY'
-import json, re, sys
-release = json.load(open(sys.argv[1]))
-tag = release.get('tag_name', '')
-if release.get('draft') or release.get('prerelease') or not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', tag):
-    sys.exit('invalid latest V2bX release')
-print(tag)
-PY
-        )
-    fi
-    asset="elise-linux-${arch}.tar.gz"
-    python3 - "$work/release.json" "$repo" "$tag" "$asset" <<'PY'
-import json, sys
-release = json.load(open(sys.argv[1]))
-repo, tag, asset = sys.argv[2:]
-expected = {f'https://github.com/{repo}/releases/download/{tag}/{name}' for name in (asset, asset + '.sha256')}
-actual = {item.get('browser_download_url') for item in release.get('assets', []) if item.get('state') == 'uploaded'}
-if release.get('tag_name') != tag or not expected <= actual:
-    sys.exit('Elise assets are missing from the requested V2bX release')
-PY
-    archive="$work/$asset"
-    checksum="$archive.sha256"
-    fetch "https://github.com/$repo/releases/download/$tag/$asset" "$archive"
-    fetch "https://github.com/$repo/releases/download/$tag/$asset.sha256" "$checksum"
-    expected=$(awk -v name="$asset" '$2 == name || $2 == "*" name {print $1}' "$checksum")
-    [[ "$expected" =~ ^[a-fA-F0-9]{64}$ ]] || die "invalid Elise checksum file"
-    actual=$(sha256sum "$archive" | awk '{print $1}')
-    [[ "${expected,,}" == "$actual" ]] || die "Elise archive checksum mismatch; installation unchanged"
-    tar -xOzf "$archive" elise/elise > "$work/elise" || die "Elise binary missing from archive"
-    tar -xOzf "$archive" elise/LICENSE > "$work/LICENSE" || die "Elise license missing from archive"
-    chmod 0755 "$work/elise"
-    binary_version=$("$work/elise" --version) || die "Elise binary cannot run on this host"
-    [[ "$binary_version" =~ ^elise\ [0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]] || die "invalid Elise binary version"
+    [[ -f "$support_dir/install.sh" ]] || die "install using https://github.com/phungvanquy/elise#installation"
+    bash "$support_dir/install.sh" install "${1:-}"
+}
 
-    mkdir -p "$bin_dir" "$config_dir"
-    chmod 0700 "$config_dir"
-    old_binary="$work/old-elise"; old_unit="$work/old-unit"; old_license="$work/old-license"
-    [[ ! -f "$binary" ]] || cp -p "$binary" "$old_binary"
-    [[ ! -f "$unit_file" ]] || cp -p "$unit_file" "$old_unit"
-    [[ ! -f "$bin_dir/elise.LICENSE" ]] || cp -p "$bin_dir/elise.LICENSE" "$old_license"
-    local -a active=()
-    local instance
-    while IFS= read -r instance; do
-        if systemctl is-active --quiet "$(instance_unit "$instance")"; then active+=("$instance"); fi
-    done < <(installed_instances)
-    if ! install -m 0755 "$work/elise" "$binary.new" ||
-       ! mv -f "$binary.new" "$binary" ||
-       ! install -m 0644 "$work/LICENSE" "$bin_dir/elise.LICENSE" ||
-       ! write_unit; then
-        restore_release "$old_binary" "$old_unit" "$old_license"
-        die "Elise installation failed; previous release restored"
-    fi
-    for instance in "${active[@]}"; do
-        preflight=$(panel_port_and_security "$(instance_dir "$instance")/elise.conf" no-bind) || preflight=""
-        mapfile -t details <<< "$preflight"
-        port=${details[0]:-}; transport=${details[2]:-}
-        listen=$(sed -n 's/^listen=//p' "$(instance_dir "$instance")/elise.conf" | head -n 1)
-        if [[ ! "$port" =~ ^[0-9]+$ || ! "$transport" =~ ^(tcp|udp)$ ]] ||
-           ! systemctl restart "$(instance_unit "$instance")" ||
-           ! systemctl is-active --quiet "$(instance_unit "$instance")" ||
-           ! wait_node_port "$listen" "$port" "$transport" "$(startup_timeout "$(instance_dir "$instance")/elise.conf")"; then
-            restore_release "$old_binary" "$old_unit" "$old_license"
-            die "Elise failed to restart; previous binary and service restored"
-        fi
-    done
-    echo "Installed $binary_version from V2bX $tag ($arch). Add a node with: V2bX elise add <vless|vmess|anytls|hysteria|hysteria2> <id>"
+health_check() {
+    local instance=$1 config preflight listen port transport
+    local -a details
+    valid_instance "$instance" || die "invalid instance"
+    config="$(instance_dir "$instance")/elise.conf"
+    preflight=$(panel_port_and_security "$config" no-bind) || return 1
+    mapfile -t details <<< "$preflight"
+    port=${details[0]:-}; transport=${details[2]:-}
+    listen=$(sed -n 's/^listen=//p' "$config" | head -n 1)
+    [[ "$port" =~ ^[0-9]+$ && "$transport" =~ ^(tcp|udp)$ ]] || return 1
+    systemctl is-active --quiet "$(instance_unit "$instance")" &&
+        wait_node_port "$listen" "$port" "$transport" "$(startup_timeout "$config")" &&
+        systemctl is-active --quiet "$(instance_unit "$instance")"
 }
 
 check_v2bx_assignment() {
@@ -302,7 +203,7 @@ else:
                                 capture_output=True, text=True, timeout=60)
         if result.returncode:
             if 'unrecognized subcommand' in result.stderr or 'requires type=xboard' in result.stderr:
-                sys.exit('this panel requires Elise from V2bX v0.6.4 or newer; update the core first')
+                sys.exit('this panel requires a newer Elise binary; run elisectl update')
             sys.exit(f'cannot fetch {panel_type} node configuration: {result.stderr.strip()}')
         data = json.loads(result.stdout)
     except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
@@ -497,6 +398,7 @@ sys.exit(0 if int(sys.argv[1]) <= 4294967295 else 1)
 PY
     instance="$kind-$node_id"; target=$(instance_dir "$instance")
     [[ ! -e "$target" ]] || die "$instance already exists; edit its config or remove it first"
+    [[ ! -f "/etc/v2bx-elise/$instance/elise.conf" ]] || die "legacy instance exists; use elisectl migrate --from-v2bx"
     check_v2bx_assignment "$kind" "$node_id" || die "remove this node from /etc/V2bX/config.json before adding it to Elise"
     read -rp 'Panel URL: ' panel_url
     python3 - "$panel_url" <<'PY' || die "invalid panel URL"
@@ -517,6 +419,7 @@ panel_key=$panel_key
 panel_node_type=$kind
 node_id=$node_id
 nodes_dir=$target/nodes
+ip_user_cache_save_dir=$state_dir/$instance
 listen=$listen
 pprof_addr=off
 auto_tls=false
@@ -555,7 +458,7 @@ EOF
     fi
     echo "Elise $instance started on $listen:$port ($transport)"
     case "$tls_choice" in
-        1) echo "Configure your certificate renewal tool to run: V2bX elise restart $instance" ;;
+        1) echo "Configure your certificate renewal tool to run: elisectl restart $instance" ;;
         2) echo "Elise renews this certificate automatically and reloads the listener after renewal." ;;
         3)
             echo "Self-signed certificate saved at $target/cert/fullchain.pem (valid for 365 days)."
@@ -586,6 +489,11 @@ remove_node() {
         systemctl stop "$(instance_unit "$instance")" || die "could not stop $instance"
     fi
     systemctl disable "$(instance_unit "$instance")" >/dev/null 2>&1 || true
+    # A migrated node has its own unit and effective drop-ins.
+    local service_dir=${unit_file%/*}
+    rm -f -- "$service_dir/$(instance_unit "$instance")"
+    rm -rf -- "$service_dir/$(instance_unit "$instance").d"
+    systemctl daemon-reload
     rm -rf -- "$(instance_dir "$instance")"
     echo "Removed Elise node $instance"
 }
@@ -599,33 +507,52 @@ uninstall_all() {
         fi
         systemctl disable "$(instance_unit "$instance")" >/dev/null 2>&1 || true
     done < <(installed_instances)
-    rm -f -- "$unit_file" "$binary" "$bin_dir/elise.LICENSE"
+    rm -f -- "$unit_file" "$binary"
     systemctl daemon-reload
-    echo "Elise binary and services removed. Configuration remains in $config_dir."
+    echo "Elise binary removed; instances stopped and disabled. Configuration, state, and service overrides retained. Reinstall with: elisectl install"
 }
 
 usage() {
     cat <<'EOF'
-Usage: V2bX elise install [V2bX release version]
-       V2bX elise add <vless|vmess|anytls|hysteria|hysteria2> <node-id> [panel]
-       V2bX elise list
-       V2bX elise start|stop|restart|status|log <protocol-id>
-       V2bX elise remove <protocol-id>
-       V2bX elise uninstall
+Usage: elisectl install|update [Elise release version]
+       elisectl add <vless|vmess|anytls|hysteria|hysteria2> <node-id> [panel]
+       elisectl list
+       elisectl start|stop|restart|status|log <protocol-id>
+       elisectl remove <protocol-id>
+       elisectl uninstall
+       elisectl migrate --from-v2bx [--dry-run]
 
 Hysteria aliases: hysteria1/hy1 -> hysteria; hy2 -> hysteria2.
 Panels: xboard (default), v2board, xiaov2board (xiaov2b), ppanel, sspanel (sspanel-uim).
-Panels other than XBoard require an Elise binary from V2bX v0.6.4 or newer.
+remove deletes the selected instance configuration and certificates.
+uninstall retains all configuration and state; install restores the binary.
 EOF
 }
 
-case "${1:-}" in
-    install|update) shift; install_binary "${1:-}" ;;
-    add) shift; add_node "${1:-}" "${2:-}" "${3:-xboard}" ;;
-    list) need_root; installed_instances ;;
-    start|stop|restart|status|log) action=$1; shift; service_action "$action" "${1:-}" ;;
-    remove) shift; remove_node "${1:-}" ;;
-    uninstall) uninstall_all ;;
-    help|-h|--help|'') usage ;;
-    *) usage; exit 2 ;;
-esac
+main() {
+    case "${1:-}" in
+        add|remove|uninstall|start|stop|restart)
+            need_root
+            command -v flock >/dev/null || die "flock (util-linux) is required"
+            exec 9>/run/lock/elise.lock
+            flock -n 9 || die "another Elise management operation is running"
+            ;;
+    esac
+    case "${1:-}" in
+        install|update) shift; install_binary "${1:-}" ;;
+        add) shift; add_node "${1:-}" "${2:-}" "${3:-xboard}" ;;
+        list) need_root; installed_instances ;;
+        start|stop|restart|status|log) action=$1; shift; service_action "$action" "${1:-}" ;;
+        remove) shift; remove_node "${1:-}" ;;
+        uninstall) uninstall_all ;;
+        migrate) shift; need_root; need_systemd; ensure_python; exec python3 "$support_dir/migrate.py" "$@" ;;
+        __health) shift; health_check "$1" ;;
+        __preflight) shift; panel_port_and_security "$1" no-bind ;;
+        help|-h|--help|'') usage ;;
+        *) usage; return 2 ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

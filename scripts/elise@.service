@@ -1,0 +1,19 @@
+[Unit]
+Description=Elise node %i
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+UMask=0077
+WorkingDirectory=/etc/elise/instances/%i
+ExecStart=/usr/local/bin/elise run -c /etc/elise/instances/%i/elise.conf
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=90
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

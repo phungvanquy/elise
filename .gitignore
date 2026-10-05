@@ -1,0 +1,10 @@
+target/
+/dist/
+__pycache__/
+*.pyc
+*.log
+*.out
+/elise.conf
+.idea/
+.vscode/
+.DS_Store
