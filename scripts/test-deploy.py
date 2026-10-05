@@ -205,6 +205,17 @@ class DeploymentTests(unittest.TestCase):
             self.run_migration()
         self.assertEqual(self.systemd.calls, [])
 
+    def test_unit_dependencies_on_v2bx_are_rejected_before_changes(self):
+        self.legacy()
+        dropin = self.paths.units / 'custom.conf'
+        self.systemd.entry('V2bX-elise@vmess-9.service')['dropins'] = [dropin]
+        for content in ('[Unit]\nRequires=V2bX.service\n',
+                        f'[Service]\nStandardOutput=append:{self.paths.at("/etc/V2bX/elise.log")}\n'):
+            dropin.write_text(content)
+            with self.assertRaisesRegex(RuntimeError, 'depends on V2bX'):
+                self.run_migration()
+        self.assertEqual(self.systemd.calls, [])
+
     def package(self):
         package = Path(self.temp.name) / 'package'
         package.mkdir()

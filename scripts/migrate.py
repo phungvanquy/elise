@@ -113,6 +113,8 @@ def validate_unit(texts, paths, instance):
                 continue
             key, item = line.split('=', 1)
             key, item = key.strip(), item.strip()
+            if any(str(paths.at(p)) in item for p in ('/etc/V2bX', '/usr/local/V2bX')) or 'V2bX.service' in item:
+                raise RuntimeError(f'Systemd {key} depends on V2bX; relocate that dependency before migration')
             if key in forbidden or (key.startswith('Exec') and key != 'ExecStart'):
                 raise RuntimeError(f'Custom systemd {key} requires manual review before migration')
             if key == 'Environment' and 'ELISE_' in item:
