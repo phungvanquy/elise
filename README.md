@@ -24,14 +24,68 @@ sudo bash /tmp/elise-install.sh install
 For a reproducible version, pin both the bootstrap script and release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/phungvanquy/elise/refs/tags/v1.0.4/install.sh -o /tmp/elise-install.sh &&
-sudo bash /tmp/elise-install.sh install v1.0.4
+curl -fsSL https://raw.githubusercontent.com/phungvanquy/elise/refs/tags/v1.0.5/install.sh -o /tmp/elise-install.sh &&
+sudo bash /tmp/elise-install.sh install v1.0.5
 ```
 
 The installer verifies the release archive's SHA-256 checksum and installs the
 binary, manager, service template, and migration tools from that same archive.
 It checks that the Rust binary version matches the requested release tag.
-Installation creates no nodes and does not start legacy V2bX-managed services.
+Without node options, installation creates no nodes. Legacy V2bX-managed
+services are not started by installation.
+
+### Install and start a node in one command
+
+For a VLESS node configured with REALITY or no TLS in the panel:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/phungvanquy/elise/refs/tags/v1.0.5/install.sh | sudo bash -s -- install v1.0.5 --panel-url='https://panel.example.com' --api-key='REPLACE_WITH_PANEL_KEY' --node-id=123 --node-type=vless
+```
+
+The arguments after `bash -s --` go to the installer. Change `--node-type` to
+match the panel node: `vless`, `vmess`, `anytls`, `hysteria`, or `hysteria2`.
+The type is required because a panel can reuse a node ID across protocols.
+The panel defaults to XBoard; use `--panel-type=v2board`, `xiaov2board`,
+`ppanel`, or `sspanel` for another adapter. The listen address defaults to
+`0.0.0.0`; override it with `--listen=::` or another IP address.
+
+If the panel node uses **certificate TLS**, append one of these sets of options
+to that command. AnyTLS and Hysteria 1/2 always require certificate TLS:
+
+```bash
+# Existing certificate and matching private key
+--cert-mode=file --cert-file=/etc/ssl/elise/fullchain.pem --key-file=/etc/ssl/elise/privkey.pem
+
+# Automatic Let's Encrypt certificate and renewal
+--cert-mode=http --domain=node.example.com --email=admin@example.com
+
+# Self-signed certificate; configure clients to trust it explicitly
+--cert-mode=self-signed --domain=node.example.com
+```
+
+HTTP mode requires DNS to point at this server and inbound TCP port 80 to
+remain available. It registers an account under the
+[Let's Encrypt subscriber agreement](https://letsencrypt.org/repository/).
+REALITY uses the keys in the panel and does not take certificate options.
+
+Node options disable all prompts; both `--name=value` and `--name value` work.
+The installer checks the panel, free listener port, and certificate settings
+before replacing Elise files or restarting existing services. It then installs
+the release, enables the new node at boot, starts it, and checks its listener.
+An existing instance is never overwritten. If the first start fails, the new
+configuration and certificates remain for diagnosis; the command returns a
+failure and prints recovery instructions. The program installation remains.
+
+For automation, replace `--api-key=...` with
+`--api-key-file=/root/.config/elise/panel.key` to read a key from a file readable
+by root. Store only the key in that file and set its permissions to `0600`.
+This keeps the literal key out of command history and process arguments.
+
+After Elise is installed, add further nodes without reinstalling the program:
+
+```bash
+sudo elisectl add --panel-url='https://panel.example.com' --api-key-file=/root/.config/elise/panel.key --node-id=124 --node-type=hysteria2 --cert-mode=http --domain=hy2.example.com --email=admin@example.com
+```
 
 ## Add and manage nodes
 
@@ -101,7 +155,7 @@ TLS settings, Hysteria, online IP limits, and XHTTP interoperability.
 
 ```bash
 sudo elisectl update          # latest stable Elise release
-sudo elisectl update v1.0.4   # explicit Elise version
+sudo elisectl update v1.0.5   # explicit Elise version
 ```
 
 Updates restart only currently running standalone instances, preserve stopped

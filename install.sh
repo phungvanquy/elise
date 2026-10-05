@@ -4,6 +4,7 @@ set -euo pipefail
 umask 077
 
 repo=phungvanquy/elise
+manager=/usr/local/bin/elisectl
 work=""
 trap '[[ -z "$work" ]] || rm -rf -- "$work"' EXIT
 die() { echo "Elise: $*" >&2; exit 1; }
@@ -64,13 +65,54 @@ PY
     resolved_tag=$tag
 }
 
-main() {
+usage() {
+    cat <<'EOF'
+Usage: bash install.sh [install|update] [vX.Y.Z]
+       bash install.sh [install] [vX.Y.Z] --node-type=TYPE --panel-url=URL --api-key=KEY --node-id=ID [options]
+
+Without node options, installs only the Elise program and management tools.
+With node options, also creates, enables, and starts one node without prompts.
+Required: --node-type (vless, vmess, anytls, hysteria, hysteria2), --panel-url,
+          --node-id, and --api-key (or --api-key-file).
+Optional: --panel-type (default xboard), --listen (default 0.0.0.0).
+For certificate TLS, choose one:
+  --cert-mode=file --cert-file=/absolute/fullchain.pem --key-file=/absolute/key.pem
+  --cert-mode=http --domain=node.example.com --email=admin@example.com
+  --cert-mode=self-signed --domain=node.example.com
+HTTP mode uses Let's Encrypt HTTP-01; DNS must point here and TCP port 80 must be open.
+Options accept --name=value or --name value. Existing nodes are never overwritten.
+Node options require Elise v1.0.5 or newer. Pin a release with the positional version.
+EOF
+}
+
+parse_install_args() {
+    local action=install option
     case "${1:-install}" in
-        install|update) [[ $# -eq 0 ]] || shift ;;
-        -h|--help|help) echo 'Usage: bash install.sh [install|update] [vX.Y.Z]'; exit 0 ;;
-        *) die 'Usage: bash install.sh [install|update] [vX.Y.Z]' ;;
+        install|update) action=${1:-install}; [[ $# -eq 0 ]] || shift ;;
     esac
-    [[ $# -le 1 ]] || die 'Too many arguments'
+    if [[ $# -gt 0 && "$1" != -* ]]; then
+        release_version=$1; shift
+        [[ "$release_version" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]] || die 'Invalid Elise release version'
+    fi
+    while [[ $# -gt 0 ]]; do
+        option=${1%%=*}
+        case "$option" in
+            --node-type|--node-id|--panel-type|--panel-url|--api-key|--api-key-file|--listen|--cert-mode|--cert-file|--key-file|--domain|--email) ;;
+            *) die 'Unknown installer option; see bash install.sh --help' ;;
+        esac
+        node_args+=("$1")
+        if [[ "$1" == *=* ]]; then
+            [[ -n "${1#*=}" ]] || die "Missing value for $option"
+            shift
+        else
+            [[ $# -ge 2 && "$2" != --* ]] || die "Missing value for $option"
+            node_args+=("$2"); shift 2
+        fi
+    done
+    [[ "$action" != update || ${#node_args[@]} -eq 0 ]] || die 'Use install to provision a node; update takes only a release version'
+}
+
+ensure_install_dependencies() {
     [[ $EUID -eq 0 ]] || die 'Run as root (sudo bash install.sh install)'
     [[ $(uname -s) == Linux && -d /run/systemd/system ]] || die 'Linux with systemd is required'
     case "$(uname -m)" in
@@ -94,10 +136,29 @@ main() {
         fi
     fi
     python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)' || die 'Python 3.8 or newer is required'
-    download_release "${1:-}" "$arch"
-    python3 "$work/install-release.py" "$work" "$resolved_tag"
 }
 
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+main() {
+    case "${1:-}" in -h|--help|help) usage; return 0 ;; esac
+    if [[ ( "${1:-}" == install || "${1:-}" == update ) && ( "${2:-}" == --help || "${2:-}" == -h ) ]]; then
+        usage; return 0
+    fi
+    local release_version="" arch
+    local -a node_args=()
+    parse_install_args "$@"
+    ensure_install_dependencies
+    download_release "$release_version" "$arch"
+    if [[ ${#node_args[@]} -gt 0 ]]; then
+        # Use the verified archive's manager and core to check the node before
+        # replacing installed files or restarting any existing Elise instances.
+        bash "$work/elisectl" __check-add "$work/elise" "${node_args[@]}" </dev/null
+    fi
+    python3 "$work/install-release.py" "$work" "$resolved_tag"
+    if [[ ${#node_args[@]} -gt 0 ]]; then
+        bash "$manager" add "${node_args[@]}" </dev/null
+    fi
+}
+
+if [[ -z "${BASH_SOURCE[0]:-}" || "${BASH_SOURCE[0]}" == "$0" ]]; then
     main "$@"
 fi

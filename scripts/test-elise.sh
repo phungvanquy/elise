@@ -332,6 +332,106 @@ print(os.environ['ELISE_TEST_NODE_INFO'])
                             input=f'http://127.0.0.1:{server.server_port}\nkey+value\n127.0.0.1\n1\n{cert}\n{bad_key}\n')
         assert result.returncode != 0 and 'invalid TLS certificate' in result.stderr
         assert not (config_root / 'anytls-9').exists()
+
+        # Non-interactive provisioning uses the same preflight and service
+        # checks, including when stdin is already exhausted by curl | bash.
+        def node_options(kind='vmess'):
+            return [f'--node-type={kind}', '--node-id', '9',
+                    f'--panel-url=http://127.0.0.1:{server.server_port}',
+                    '--api-key', 'key+value', '--listen=127.0.0.1']
+
+        key_file = Path(root) / 'panel-key'
+        key_file.write_text('key+value\n')
+        key_file.chmod(0o600)
+        for requested, kind, payload, tls_args in [
+            ('vmess', 'vmess', {'tls': 0}, []),
+            ('vless', 'vless', {'tls': 2, 'tls_settings': {'private_key': 'private', 'public_key': 'public'}}, []),
+            ('AnyTLS', 'anytls', {}, ['--cert-mode=file', '--cert-file', cert, '--key-file', key]),
+            ('hy2', 'hysteria2', {}, ['--cert-mode=http', '--domain=node.example.com', '--email=admin@example.com']),
+            ('hy1', 'hysteria', {}, ['--cert-mode=self-signed', '--domain=node.example.com']),
+        ]:
+            server.node_transport = socket.SOCK_DGRAM if kind.startswith('hysteria') else socket.SOCK_STREAM
+            with socket.socket(socket.AF_INET, server.node_transport) as sock:
+                sock.bind(('127.0.0.1', 0))
+                server.node_port = sock.getsockname()[1]
+            configure_panel(kind, {'server_port': server.node_port, **payload})
+            options = node_options(requested) + tls_args
+            if kind == 'vless':
+                options[4:6] = ['--api-key-file', str(key_file)]
+            setup = service_setup + 'http_tls_preflight() { :; }; '
+            before_services = service_log.read_bytes()
+            checked = run_helper(setup + 'add_check_only=true; add_node "$@"', config_root, *options, input='', check=True)
+            assert 'preflight passed' in checked.stdout
+            assert not (config_root / f'{kind}-9').exists()
+            assert service_log.read_bytes() == before_services
+            result = run_helper(setup + 'add_node "$@"', config_root, *options, input='', check=True)
+            assert 'key+value' not in result.stdout + result.stderr
+            config = config_root / f'{kind}-9/elise.conf'
+            contents = config.read_text()
+            assert f'panel_node_type={kind}\n' in contents and 'panel_key=key+value\n' in contents
+            assert config.stat().st_mode & 0o777 == 0o600
+            assert config.parent.stat().st_mode & 0o777 == 0o700
+            if kind == 'hysteria2':
+                assert 'cert_mode=http\n' in contents and 'acme_email=admin@example.com\n' in contents
+            if kind == 'hysteria':
+                assert (config.parent / 'cert/privkey.pem').stat().st_mode & 0o777 == 0o600
+            before_services = service_log.read_bytes()
+            again = run_helper(setup + 'add_node "$@"', config_root, *options, input='')
+            assert again.returncode != 0 and 'already exists' in again.stderr
+            assert config.read_text() == contents and service_log.read_bytes() == before_services
+            run_helper(service_setup + 'remove_node "$1"', config_root, f'{kind}-9', check=True)
+            server.node_listener.close()
+            server.node_listener = None
+
+        # Reject incomplete/ambiguous options without reading stdin, starting a
+        # service, or leaving an instance directory. Never echo secret values.
+        configure_panel('vmess', {'server_port': server.node_port, 'tls': 0})
+        options = node_options()
+        invalid_options = [
+            (options[1:], 'requires --node-type'),
+            (options + ['--node-id=10'], 'duplicate'),
+            (options[:-1] + ['--listen=999.0.0.1'], 'IP address'),
+            (options + ['--domain=node.example.com'], 'require --cert-mode'),
+            (options + ['--cert-mode=unknown'], '--cert-mode must be'),
+            (options + ['--cert-mode=file'], 'requires --cert-file'),
+            (options + ['--cert-mode=http', '--domain=node.example.com'], 'requires --domain and --email'),
+            (options + ['--cert-mode=self-signed'], 'requires --domain only'),
+            (options + ['--api-key-file', key_file], 'only one of'),
+            (options + ['--domain'], 'missing value'),
+            (options + ['--unknown=do-not-print-this'], 'unknown node option'),
+            (options[:4] + ['--api-key=secret\nnode_id=42'], 'control character'),
+            (options[:4] + ['--api-key=secret\rnode_id=42'], 'control character'),
+            (options[:4] + ['--api-key= secret '], 'invalid panel API key'),
+            (options[:4] + ['--api-key-file=/no/such/key'], 'readable regular file'),
+            (options[:4] + ['--api-key='], 'empty value'),
+            (['--node-type=vmess', '--node-id=4294967296'] + options[3:], 'u32 range'),
+            (['--node-type=vmess', '--node-id=0'] + options[3:], 'positive integer'),
+            (options + ['--cert-mode=file', '--cert-file', cert, '--key-file', key], 'does not use certificate TLS'),
+        ]
+        before_services = service_log.read_bytes()
+        for arguments, error in invalid_options:
+            result = run_helper(service_setup + 'add_node "$@"', config_root, *arguments, input='')
+            assert result.returncode != 0 and error in result.stderr, (arguments, result)
+            assert not (config_root / 'vmess-9').exists()
+            assert service_log.read_bytes() == before_services
+            assert 'do-not-print-this' not in result.stdout + result.stderr
+            assert 'secret' not in result.stdout + result.stderr
+
+        configure_panel('anytls', {'server_port': server.node_port, 'tls': 1})
+        result = run_helper(service_setup + 'add_node "$@"', config_root, *node_options('anytls'), input='')
+        assert result.returncode != 0 and 'this node requires TLS' in result.stderr
+        assert not (config_root / 'anytls-9').exists()
+        result = run_helper(service_setup + 'add_node "$@"', config_root, *node_options('anytls'),
+                            '--cert-mode=file', '--cert-file', cert, '--key-file', bad_key, input='')
+        assert result.returncode != 0 and 'invalid TLS certificate' in result.stderr
+        assert not (config_root / 'anytls-9').exists()
+
+        # An API adapter's diagnostics can contain a credential-bearing URL.
+        panel_binary.write_text("#!/bin/sh\necho 'failed token=key%2Bvalue raw=key+value' >&2\nexit 1\n")
+        result = run_helper(native_setup + 'set -- "$1" "${@:3}"; add_node "$@"', config_root, '--panel-type=sspanel', panel_binary,
+                            *node_options('anytls'), input='')
+        assert result.returncode != 0 and '[redacted]' in result.stderr
+        assert 'key+value' not in result.stderr and 'key%2Bvalue' not in result.stderr
 finally:
     if server.node_listener:
         server.node_listener.close()

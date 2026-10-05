@@ -80,8 +80,9 @@ installed_instances() {
 
 install_binary() {
     need_root; need_systemd
+    [[ $# -le 1 ]] || die "install/update takes only an optional release version"
     [[ -f "$support_dir/install.sh" ]] || die "install using https://github.com/phungvanquy/elise#installation"
-    bash "$support_dir/install.sh" install "${1:-}"
+    bash "$support_dir/install.sh" install "$@"
 }
 
 health_check() {
@@ -185,6 +186,11 @@ for line in pathlib.Path(sys.argv[1]).read_text().splitlines():
         values[key.strip()] = value.strip()
 kind = values['panel_node_type']
 panel_type = values.get('type', 'xboard')
+def redact(message):
+    secret = values['panel_key']
+    for variant in (urllib.parse.quote_plus(secret), urllib.parse.quote(secret, safe=''), secret):
+        message = message.replace(variant, '[redacted]')
+    return message
 if panel_type == 'xboard':
     # Keep XBoard installation compatible with earlier Elise binaries.
     query = urllib.parse.urlencode({'node_type': kind, 'node_id': values['node_id'], 'token': values['panel_key']})
@@ -195,7 +201,7 @@ if panel_type == 'xboard':
             payload = json.load(response)
         data = payload.get('data', payload)
     except Exception as exc:
-        sys.exit(f'cannot fetch panel node configuration: {exc}')
+        sys.exit('cannot fetch panel node configuration: ' + redact(str(exc)))
 else:
     # Use the same API adapters and protocol selection as the running core.
     try:
@@ -204,10 +210,10 @@ else:
         if result.returncode:
             if 'unrecognized subcommand' in result.stderr or 'requires type=xboard' in result.stderr:
                 sys.exit('this panel requires a newer Elise binary; run elisectl update')
-            sys.exit(f'cannot fetch {panel_type} node configuration: {result.stderr.strip()}')
+            sys.exit(f'cannot fetch {panel_type} node configuration: ' + redact(result.stderr.strip()))
         data = json.loads(result.stdout)
     except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
-        sys.exit(f'cannot inspect {panel_type} node configuration: {exc}')
+        sys.exit(f'cannot inspect {panel_type} node configuration: ' + redact(str(exc)))
 reported = data.get('server_type') or data.get('protocol') or data.get('node_type') or data.get('type')
 def protocol(name):
     name = name.lower()
@@ -333,20 +339,31 @@ PY
 }
 
 configure_tls() {
-    local target=$1 port=$2 transport=$3 mode domain email cert_file key_file
-    cat <<'EOF'
+    local target=$1 port=$2 transport=$3 mode
+    if [[ "$non_interactive" == true ]]; then
+        case "$cert_mode" in
+            file) mode=1 ;;
+            http) mode=2 ;;
+            self-signed) mode=3 ;;
+            *) die "this node requires TLS; supply --cert-mode=file with --cert-file and --key-file, --cert-mode=http with --domain and --email, or --cert-mode=self-signed with --domain" ;;
+        esac
+    else
+        cat <<'EOF'
 TLS certificate:
   1) Existing certificate and private key files (default)
   2) Automatic Let's Encrypt certificate (HTTP-01, with automatic renewal)
   3) Generate a self-signed certificate (clients must trust it explicitly)
 EOF
-    read -rp 'Certificate mode [1]: ' mode
-    mode=${mode:-1}
+        read -rp 'Certificate mode [1]: ' mode
+        mode=${mode:-1}
+    fi
     case "$mode" in
         1)
-            read -rp 'TLS certificate file (full chain): ' cert_file
-            read -rp 'TLS private key file: ' key_file
-            [[ "$cert_file" == /* && "$key_file" == /* && -s "$cert_file" && -s "$key_file" && "$cert_file$key_file" != *$'\r'* ]] || die "TLS certificate and key must be nonempty absolute files"
+            if [[ "$non_interactive" == false ]]; then
+                read -rp 'TLS certificate file (full chain): ' cert_file
+                read -rp 'TLS private key file: ' key_file
+            fi
+            [[ "$cert_file" == /* && "$key_file" == /* && -s "$cert_file" && -s "$key_file" && "$cert_file$key_file" != *[[:cntrl:]]* ]] || die "TLS certificate and key must be nonempty absolute files"
             python3 - "$cert_file" "$key_file" <<'PY' || die "invalid TLS certificate or private key"
 import ssl, sys
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -355,14 +372,18 @@ PY
             printf 'cert_mode=file\ncert_file=%s\nkey_file=%s\n' "$cert_file" "$key_file" >> "$work/elise.conf"
             ;;
         2|3)
-            read -rp 'TLS hostname (for example node.example.com): ' domain
+            if [[ "$non_interactive" == false ]]; then
+                read -rp 'TLS hostname (for example node.example.com): ' domain
+            fi
             validate_tls_domain "$domain" || die "invalid TLS hostname"
             domain=${domain,,}
             printf 'cert_domain=%s\ncert_file=%s/cert/fullchain.pem\nkey_file=%s/cert/privkey.pem\n' "$domain" "$target" "$target" >> "$work/elise.conf"
             if [[ "$mode" == 2 ]]; then
                 echo "Point the domain's A/AAAA records at this server and allow inbound TCP port 80. Keep port 80 available for renewal."
                 echo "This mode registers an account under the Let's Encrypt subscriber agreement: https://letsencrypt.org/repository/"
-                read -rp "Let's Encrypt account email: " email
+                if [[ "$non_interactive" == false ]]; then
+                    read -rp "Let's Encrypt account email: " email
+                fi
                 [[ "$email" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ && "$email" != *'#'* ]] || die "invalid account email"
                 http_tls_preflight "$domain" "$port" "$transport" || die "automatic TLS preflight failed"
                 printf 'cert_mode=http\ncert_key_length=ec-256\nacme_server=letsencrypt\nacme_email=%s\n' "$email" >> "$work/elise.conf"
@@ -383,12 +404,83 @@ PY
     tls_choice=$mode
 }
 
+parse_add_args() {
+    # These options belong to add_node's local scope, shared with configure_tls.
+    local option value
+    local -A seen=()
+    if [[ $# -gt 0 && "$1" != -* ]]; then
+        kind=$1; shift
+        node_id=${1:-}; [[ $# -eq 0 ]] || shift
+        seen[--node-type]=1; seen[--node-id]=1
+        if [[ $# -gt 0 && "$1" != -* ]]; then
+            panel_type=$1; shift
+            seen[--panel-type]=1
+        fi
+    fi
+    if [[ $# -gt 0 || "${add_check_only:-false}" == true ]]; then
+        non_interactive=true
+    fi
+    while [[ $# -gt 0 ]]; do
+        option=${1%%=*}
+        case "$option" in
+            --node-type|--node-id|--panel-type|--panel-url|--api-key|--api-key-file|--listen|--cert-mode|--cert-file|--key-file|--domain|--email) ;;
+            *) die "unknown node option; see elisectl --help" ;;
+        esac
+        [[ ! ${seen[$option]+yes} ]] || die "duplicate option: $option"
+        seen[$option]=1
+        if [[ "$1" == *=* ]]; then
+            value=${1#*=}; shift
+        else
+            [[ $# -ge 2 && "$2" != --* ]] || die "missing value for $option"
+            value=$2; shift 2
+        fi
+        [[ -n "$value" && "$value" != *[[:cntrl:]]* ]] || die "empty value or control character in $option"
+        case "$option" in
+            --node-type) kind=$value ;;
+            --node-id) node_id=$value ;;
+            --panel-type) panel_type=$value ;;
+            --panel-url) panel_url=$value ;;
+            --api-key) panel_key=$value ;;
+            --api-key-file) api_key_file=$value ;;
+            --listen) listen=$value ;;
+            --cert-mode) cert_mode=$value ;;
+            --cert-file) cert_file=$value ;;
+            --key-file) key_file=$value ;;
+            --domain) domain=$value ;;
+            --email) email=$value ;;
+        esac
+    done
+    [[ -z "$api_key_file" || -z "$panel_key" ]] || die "use only one of --api-key and --api-key-file"
+    if [[ -n "$api_key_file" ]]; then
+        [[ -f "$api_key_file" && -r "$api_key_file" ]] || die "--api-key-file must be a readable regular file"
+        panel_key=$(cat -- "$api_key_file")
+    fi
+    if [[ "$non_interactive" == true ]]; then
+        [[ -n "$kind" && -n "$node_id" && -n "$panel_url" && -n "$panel_key" ]] || die "non-interactive add requires --node-type, --node-id, --panel-url, and --api-key (or --api-key-file)"
+        case "$cert_mode" in
+            '') [[ -z "$cert_file$key_file$domain$email" ]] || die "TLS options require --cert-mode" ;;
+            file)
+                [[ -n "$cert_file" && -n "$key_file" && -z "$domain$email" ]] || die "--cert-mode=file requires --cert-file and --key-file only"
+                ;;
+            http)
+                [[ -n "$domain" && -n "$email" && -z "$cert_file$key_file" ]] || die "--cert-mode=http requires --domain and --email only"
+                ;;
+            self-signed)
+                [[ -n "$domain" && -z "$cert_file$key_file$email" ]] || die "--cert-mode=self-signed requires --domain only"
+                ;;
+            *) die "--cert-mode must be file, http, or self-signed" ;;
+        esac
+    fi
+}
+
 add_node() {
+    local kind="" node_id="" panel_type=xboard instance target panel_url="" panel_key="" listen=0.0.0.0 security port transport preflight tls_choice=""
+    local non_interactive=false cert_mode="" cert_file="" key_file="" domain="" email="" api_key_file=""
+    local -a details
+    parse_add_args "$@"
     need_root; need_systemd
     [[ -x "$binary" ]] || die "install the Elise binary first"
     ensure_python
-    local kind=${1:-} node_id=${2:-} panel_type=${3:-xboard} instance target panel_url panel_key listen security port transport preflight tls_choice=""
-    local -a details
     kind=$(normalize_kind "$kind") || die "type must be vless, vmess, anytls, hysteria (hysteria1/hy1), or hysteria2 (hy2)"
     panel_type=$(normalize_panel "$panel_type") || die "panel must be xboard, v2board, xiaov2board, ppanel, or sspanel"
     [[ "$node_id" =~ ^[1-9][0-9]*$ ]] || die "node ID must be a positive integer"
@@ -397,21 +489,31 @@ import sys
 sys.exit(0 if int(sys.argv[1]) <= 4294967295 else 1)
 PY
     instance="$kind-$node_id"; target=$(instance_dir "$instance")
-    [[ ! -e "$target" ]] || die "$instance already exists; edit its config or remove it first"
+    [[ ! -e "$target" && ! -L "$target" ]] || die "$instance already exists; edit its config or remove it first"
     [[ ! -f "/etc/v2bx-elise/$instance/elise.conf" ]] || die "legacy instance exists; use elisectl migrate --from-v2bx"
     check_v2bx_assignment "$kind" "$node_id" || die "remove this node from /etc/V2bX/config.json before adding it to Elise"
-    read -rp 'Panel URL: ' panel_url
+    if [[ "$non_interactive" == false ]]; then
+        read -rp 'Panel URL: ' panel_url
+    fi
     python3 - "$panel_url" <<'PY' || die "invalid panel URL"
 import sys, urllib.parse
 url = urllib.parse.urlsplit(sys.argv[1])
-sys.exit(0 if url.scheme in ('http', 'https') and url.netloc and not url.query and not url.fragment and not any(c.isspace() for c in sys.argv[1]) else 1)
+sys.exit(0 if url.scheme in ('http', 'https') and url.hostname and not url.username and not url.password and not url.query and not url.fragment and not any(c.isspace() for c in sys.argv[1]) else 1)
 PY
-    read -rsp 'Panel API key: ' panel_key; echo
-    [[ -n "$panel_key" && "$panel_key" != *$'\r'* ]] || die "invalid panel API key"
-    read -rp 'Listen address [0.0.0.0]: ' listen
+    if [[ "$non_interactive" == false ]]; then
+        read -rsp 'Panel API key: ' panel_key; echo
+        read -rp 'Listen address [0.0.0.0]: ' listen
+    fi
+    [[ -n "$panel_key" && "$panel_key" != *[[:cntrl:]]* && "$panel_key" != [[:space:]]* && "$panel_key" != *[[:space:]] ]] || die "invalid panel API key"
     listen=${listen:-0.0.0.0}
-    [[ "$listen" =~ ^[0-9a-fA-F:.]+$ ]] || die "listen address must be an IP address"
-    work=$(mktemp -d /tmp/v2bx-elise.XXXXXX)
+    python3 - "$listen" <<'PY' || die "listen address must be an IP address"
+import ipaddress, sys
+try:
+    ipaddress.ip_address(sys.argv[1])
+except ValueError:
+    sys.exit(1)
+PY
+    work=$(mktemp -d /tmp/elise-node.XXXXXX)
     cat > "$work/elise.conf" <<EOF
 type=$panel_type
 panel_url=$panel_url
@@ -437,6 +539,12 @@ EOF
     [[ "$port" =~ ^[0-9]+$ && "$security" =~ ^[0-2]$ && "$transport" =~ ^(tcp|udp)$ ]] || die "panel preflight failed"
     if [[ "$security" == 1 ]]; then
         configure_tls "$target" "$port" "$transport"
+    elif [[ -n "$cert_mode" ]]; then
+        die "the panel node does not use certificate TLS; remove the certificate options or change the node in the panel"
+    fi
+    if [[ "${add_check_only:-false}" == true ]]; then
+        echo "Elise $instance preflight passed"
+        return 0
     fi
     mkdir -p "$target/nodes"
     chmod 0700 "$config_dir" "$target" "$target/nodes"
@@ -516,6 +624,7 @@ usage() {
     cat <<'EOF'
 Usage: elisectl install|update [Elise release version]
        elisectl add <vless|vmess|anytls|hysteria|hysteria2> <node-id> [panel]
+       elisectl add --node-type=TYPE --node-id=ID --panel-url=URL --api-key=KEY [options]
        elisectl list
        elisectl start|stop|restart|status|log <protocol-id>
        elisectl remove <protocol-id>
@@ -524,14 +633,27 @@ Usage: elisectl install|update [Elise release version]
 
 Hysteria aliases: hysteria1/hy1 -> hysteria; hy2 -> hysteria2.
 Panels: xboard (default), v2board, xiaov2board (xiaov2b), ppanel, sspanel (sspanel-uim).
+Node options (using any option disables all prompts):
+  --panel-type=NAME             Default: xboard
+  --listen=IP                   Default: 0.0.0.0
+  --api-key-file=PATH            Read the key from a file instead of --api-key
+  --cert-mode=file              Requires --cert-file=PATH and --key-file=PATH
+  --cert-mode=http              Requires --domain=HOST and --email=ADDRESS
+  --cert-mode=self-signed       Requires --domain=HOST; clients must trust the certificate
+TLS options are required only for certificate TLS, as configured in the panel.
+HTTP mode uses Let's Encrypt HTTP-01; DNS must point here and TCP port 80 must be open.
+Options accept --name=value or --name value. Existing instances are never overwritten.
 remove deletes the selected instance configuration and certificates.
 uninstall retains all configuration and state; install restores the binary.
 EOF
 }
 
 main() {
+    if [[ "${1:-}" == add && ( "${2:-}" == --help || "${2:-}" == -h ) ]]; then
+        usage; return 0
+    fi
     case "${1:-}" in
-        add|remove|uninstall|start|stop|restart)
+        add|__check-add|remove|uninstall|start|stop|restart)
             need_root
             command -v flock >/dev/null || die "flock (util-linux) is required"
             exec 9>/run/lock/elise.lock
@@ -539,8 +661,9 @@ main() {
             ;;
     esac
     case "${1:-}" in
-        install|update) shift; install_binary "${1:-}" ;;
-        add) shift; add_node "${1:-}" "${2:-}" "${3:-xboard}" ;;
+        install|update) shift; install_binary "$@" ;;
+        add) shift; add_node "$@" ;;
+        __check-add) shift; binary=$1; shift; local add_check_only=true; add_node "$@" ;;
         list) need_root; installed_instances ;;
         start|stop|restart|status|log) action=$1; shift; service_action "$action" "${1:-}" ;;
         remove) shift; remove_node "${1:-}" ;;

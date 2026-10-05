@@ -329,5 +329,124 @@ test "$resolved_tag" = v1.0.4
         self.assertIn('Unexpected', self.download().stderr)
 
 
+class BootstrapProvisionTests(unittest.TestCase):
+    """Run the real bootstrap dispatch with offline downloads and no system writes."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.directory = Path(self.temp.name)
+        self.bootstrap = Path(__file__).resolve().parent.parent / 'install.sh'
+        self.log = self.directory / 'calls.jsonl'
+        self.log.write_text('')
+        (self.directory / 'elise').write_text('unused core fixture')
+        (self.directory / 'elisectl').write_text('''#!/bin/bash
+python3 - "$@" <<'PY'
+import json, os, pathlib, sys
+with (pathlib.Path(os.environ['FIXTURE']) / 'calls.jsonl').open('a') as log:
+    log.write(json.dumps(sys.argv[1:]) + '\\n')
+sys.exit(1 if os.environ.get('FAIL_STAGE') == sys.argv[1] else 0)
+PY
+''')
+        (self.directory / 'install-release.py').write_text('''
+import json, os, pathlib, sys
+with (pathlib.Path(os.environ['FIXTURE']) / 'calls.jsonl').open('a') as log:
+    log.write(json.dumps(['install', sys.argv[2]]) + '\\n')
+sys.exit(1 if os.environ.get('FAIL_STAGE') == 'install' else 0)
+''')
+        self.options = ['--node-type=vmess', '--panel-url', 'https://panel.example.com',
+                        '--api-key=literal +$value;key', '--node-id=9']
+
+    def run_bootstrap(self, arguments=(), fail=''):
+        command = '''
+source "$1"; shift
+manager="$FIXTURE/elisectl"
+ensure_install_dependencies() { arch=arm64; }
+download_release() {
+    printf '%s' "$1" > "$FIXTURE/requested"
+    work=$(mktemp -d)
+    cp "$FIXTURE/elisectl" "$FIXTURE/elise" "$FIXTURE/install-release.py" "$work/"
+    resolved_tag=v1.0.5
+}
+main "$@"
+'''
+        result = subprocess.run(['bash', '-c', command, 'bash', str(self.bootstrap), *arguments],
+                                env=dict(os.environ, FIXTURE=str(self.directory), FAIL_STAGE=fail),
+                                input='', capture_output=True, text=True, timeout=20)
+        calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+        return result, calls
+
+    def test_checks_then_installs_then_provisions_with_exact_arguments(self):
+        result, calls = self.run_bootstrap(['install', 'v1.0.5', *self.options])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([call[0] for call in calls], ['__check-add', 'install', 'add'])
+        self.assertEqual(calls[0][2:], self.options)
+        self.assertEqual(calls[1], ['install', 'v1.0.5'])
+        self.assertEqual(calls[2][1:], self.options)
+        self.assertEqual((self.directory / 'requested').read_text(), 'v1.0.5')
+
+    def test_bare_flags_install_latest(self):
+        result, calls = self.run_bootstrap(self.options)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls[-1], ['add', *self.options])
+        self.assertEqual((self.directory / 'requested').read_text(), '')
+
+    def test_default_install_and_update_create_no_nodes(self):
+        for arguments in ([], ['install'], ['update'], ['update', 'v1.0.5']):
+            with self.subTest(arguments=arguments):
+                self.log.write_text('')
+                result, calls = self.run_bootstrap(arguments)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(calls, [['install', 'v1.0.5']])
+
+    def test_manager_update_passes_optional_version_without_empty_argument(self):
+        (self.directory / 'install.sh').write_text('''#!/bin/bash
+python3 - "$@" <<'PY'
+import json, sys
+print(json.dumps(sys.argv[1:]))
+PY
+''')
+        manager = Path(__file__).with_name('elise.sh')
+        for arguments in ([], ['v1.0.5']):
+            with self.subTest(arguments=arguments):
+                command = 'source "$1"; shift; support_dir=$1; shift; need_root() { :; }; need_systemd() { :; }; main update "$@"'
+                result = subprocess.run(['bash', '-c', command, 'bash', str(manager), str(self.directory), *arguments],
+                                        text=True, capture_output=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout), ['install', *arguments])
+
+    def test_preflight_failure_never_installs(self):
+        result, calls = self.run_bootstrap(self.options, fail='__check-add')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual([call[0] for call in calls], ['__check-add'])
+
+    def test_install_failure_never_provisions(self):
+        result, calls = self.run_bootstrap(self.options, fail='install')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual([call[0] for call in calls], ['__check-add', 'install'])
+
+    def test_node_failure_is_reported(self):
+        result, calls = self.run_bootstrap(self.options, fail='add')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual([call[0] for call in calls], ['__check-add', 'install', 'add'])
+
+    def test_invalid_bootstrap_arguments_do_not_install(self):
+        for arguments in (['--api-key'], ['--api-key='], ['--node-id', '--listen=::'],
+                          ['--unknown=do-not-print-this'], ['install', '../../file'],
+                          ['update', *self.options]):
+            with self.subTest(arguments=arguments):
+                result, calls = self.run_bootstrap(arguments)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(calls, [])
+                self.assertNotIn('do-not-print-this', result.stdout + result.stderr)
+
+    def test_piped_script_supports_help_without_systemd_or_root(self):
+        result = subprocess.run(['bash', '-s', '--', '--help'], input=self.bootstrap.read_text(),
+                                text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('--node-type', result.stdout)
+        self.assertIn('--api-key-file', result.stdout)
+
+
 if __name__ == '__main__':
     unittest.main()
