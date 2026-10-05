@@ -39,7 +39,13 @@ services are not started by installation.
 For a VLESS node configured with REALITY or no TLS in the panel:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/phungvanquy/elise/refs/tags/v1.0.5/install.sh | sudo bash -s -- install v1.0.5 --panel-url='https://panel.example.com' --api-key='REPLACE_WITH_PANEL_KEY' --node-id=123 --node-type=vless
+curl -fsSL \
+  https://raw.githubusercontent.com/phungvanquy/elise/refs/tags/v1.0.5/install.sh | \
+  sudo bash -s -- install v1.0.5 \
+    --panel-url='https://panel.example.com' \
+    --api-key='REPLACE_WITH_PANEL_KEY' \
+    --node-id=123 \
+    --node-type=vless
 ```
 
 The arguments after `bash -s --` go to the installer. Change `--node-type` to
