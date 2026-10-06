@@ -2,6 +2,7 @@
 set -euo pipefail
 
 helper=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/elise.sh
+python3 "${helper%/*}/test-purge.py"
 python3 - "$helper" <<'PY'
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path

@@ -276,6 +276,32 @@ remain available for recovery; `elisectl install` reinstalls the core.
 `elisectl remove <instance>` deletes its configuration and certificates after
 stopping it. External certificates and retained state are not deleted.
 
+To permanently remove **all standalone Elise instances and their retained data**:
+
+```bash
+sudo elisectl purge --yes
+```
+
+Purge stops all discovered `elise@` instance services, including orphaned and migrated
+units, before deleting files. It removes `/etc/elise`, `/var/lib/elise` (including
+backups and pending traffic), `/usr/local/lib/elise`, `/usr/local/share/licenses/elise`,
+both `elise` and `elisectl` binaries, and Elise's systemd template, instance units,
+drop-ins and enablement links. If a service cannot be stopped, no files are deleted.
+`--yes` is required; this cannot be undone. The command also works after `uninstall`.
+
+External certificate/log/state paths, original V2bX directories, and the host's system
+journal are preserved. Symlinks inside Elise's directories are removed without deleting
+their external targets.
+
+If your installed manager does not yet include `purge` (including v1.0.8), use the
+current management script directly. **No binary rebuild, upgrade, or new release is needed:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/phungvanquy/elise/refs/heads/main/scripts/elise.sh -o /tmp/elise-manager.sh &&
+sudo bash /tmp/elise-manager.sh purge --yes
+```
+
+
 ## Build and test
 
 ```bash

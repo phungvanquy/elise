@@ -7,6 +7,7 @@ binary="${bin_dir}/elise"
 config_dir="/etc/elise/instances"
 state_dir="/var/lib/elise"
 support_dir="/usr/local/lib/elise"
+license_dir="/usr/local/share/licenses/elise"
 v2bx_config="${V2BX_CONFIG_PATH:-/etc/V2bX/config.json}"
 unit_file="/etc/systemd/system/elise@.service"
 work=""
@@ -618,6 +619,63 @@ uninstall_all() {
     echo "Elise binary removed; instances stopped and disabled. Configuration, state, and service overrides retained. Reinstall with: elisectl install"
 }
 
+# Purge only the standalone installation's namespaces. Never chase configured
+# certificate/log/state paths: migrated instances can reference V2bX-owned data.
+purge_all() {
+    [[ $# -eq 1 && "$1" == --yes ]] || die "purge permanently deletes Elise configuration, certificates, state and backups; run: elisectl purge --yes"
+    need_root; need_systemd
+    local listed unit rest file load_state instance service_dir=${unit_file%/*}
+    local config_root=${config_dir%/instances}
+    local -A units=()
+    [[ "$config_root" != "$config_dir" && -n "$config_root" && "$config_root" != / ]] || die "invalid Elise configuration directory"
+
+    # Include orphaned/failed services and migrated instance units, even after
+    # uninstall removed the template or a configuration file was deleted.
+    listed=$(systemctl list-units --all --plain --no-legend 'elise@*.service') || die "could not enumerate Elise services"
+    while read -r unit rest; do
+        [[ "$unit" == elise@?*.service ]] && units["$unit"]=1
+    done <<< "$listed"
+    listed=$(systemctl list-unit-files --no-legend 'elise@*.service') || die "could not enumerate Elise unit files"
+    while read -r unit rest; do
+        [[ "$unit" == elise@?*.service ]] && units["$unit"]=1
+    done <<< "$listed"
+    while IFS= read -r instance; do
+        units["$(instance_unit "$instance")"]=1
+    done < <(installed_instances)
+    for file in "$service_dir"/elise@*.service "$service_dir"/elise@*.service.d; do
+        [[ -e "$file" || -L "$file" ]] || continue
+        unit=${file##*/}; unit=${unit%.d}
+        [[ "$unit" == elise@?*.service ]] && units["$unit"]=1
+    done
+
+    # Stop every service before deleting anything. This includes activating or
+    # reloading services, which an is-active-only check can miss.
+    for unit in "${!units[@]}"; do
+        load_state=$(systemctl show "$unit" --property=LoadState --value) || die "could not inspect $unit"
+        [[ -n "$load_state" ]] || die "empty service state for $unit"
+        if [[ "$load_state" != not-found ]]; then
+            systemctl stop "$unit" || die "could not stop $unit; no files deleted"
+        fi
+    done
+    for unit in "${!units[@]}"; do
+        # Missing templates after uninstall can make disable return nonzero.
+        systemctl disable "$unit" >/dev/null 2>&1 || true
+        systemctl reset-failed "$unit" >/dev/null 2>&1 || true
+    done
+    # Remove only Elise unit names, including stale enablement links. rm does
+    # not follow symlinks to external certificates, state, or drop-in targets.
+    for file in "$service_dir"/elise@*.service "$service_dir"/elise@*.service.d \
+                "$service_dir"/*.wants/elise@*.service "$service_dir"/*.requires/elise@*.service; do
+        [[ -e "$file" || -L "$file" ]] || continue
+        rm -rf --one-file-system -- "$file"
+    done
+    systemctl daemon-reload || die "could not reload systemd; data retained"
+    rm -rf --one-file-system -- "$config_root" "$state_dir" "$support_dir" "$license_dir"
+    rm -f -- "$binary" "$bin_dir/elisectl"
+    echo "Elise purged: services, binaries, configuration, local certificates, state and backups removed."
+    echo "External files, legacy V2bX data and the system journal were preserved."
+}
+
 usage() {
     cat <<'EOF'
 Usage: elisectl install|update [Elise release version]
@@ -627,6 +685,7 @@ Usage: elisectl install|update [Elise release version]
        elisectl start|stop|restart|status|log <protocol-id>
        elisectl remove <protocol-id>
        elisectl uninstall
+       elisectl purge --yes
        elisectl migrate --from-v2bx [--dry-run]
 
 Hysteria aliases: hysteria1/hy1 -> hysteria; hy2 -> hysteria2.
@@ -643,6 +702,8 @@ HTTP mode uses Let's Encrypt HTTP-01; DNS must point here and TCP port 80 must b
 Options accept --name=value or --name value. Existing instances are never overwritten.
 remove deletes the selected instance configuration and certificates.
 uninstall retains all configuration and state; install restores the binary.
+purge --yes permanently removes standalone Elise configuration, local certificates,
+state, backups, service overrides, binaries and manager; external/V2bX files remain.
 EOF
 }
 
@@ -651,7 +712,7 @@ main() {
         usage; return 0
     fi
     case "${1:-}" in
-        add|__check-add|remove|uninstall|start|stop|restart)
+        add|__check-add|remove|uninstall|purge|start|stop|restart)
             need_root
             command -v flock >/dev/null || die "flock (util-linux) is required"
             exec 9>/run/lock/elise.lock
@@ -666,6 +727,7 @@ main() {
         start|stop|restart|status|log) action=$1; shift; service_action "$action" "${1:-}" ;;
         remove) shift; remove_node "${1:-}" ;;
         uninstall) uninstall_all ;;
+        purge) shift; purge_all "$@" ;;
         migrate) shift; need_root; need_systemd; ensure_python; exec python3 "$support_dir/migrate.py" "$@" ;;
         __health) shift; health_check "$1" ;;
         __preflight) shift; panel_port_and_security "$1" no-bind ;;
