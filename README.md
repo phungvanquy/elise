@@ -8,23 +8,67 @@ service. V2bX is not required to build, install, or run Elise.
 
 ## Installation
 
-Supported release targets: **Linux amd64 and arm64 with systemd**. Run the
-installer as root. Bash, curl, CA certificates, tar, sha256sum, flock
-(util-linux), and Python 3.8+ are required. The installer can provision Python
-with apt-get, dnf, or yum. Self-signed certificates also need OpenSSL; the wizard
-can install it with those package managers. Alpine/OpenRC is not supported by
-these installation tools.
+For a first installation, [choose your panel type](#choose-your-panel-type),
+[install Elise](#install-elise), then [add a node](#add-and-manage-nodes).
+If Elise is already installed, go straight to adding a node.
 
-Install the [latest stable release](https://github.com/phungvanquy/elise/releases/latest)
-(current release: **v1.0.8**). Omit the version argument to always install the
-latest stable release:
+### Before you begin
+
+- Use a **Linux amd64 or arm64 server with systemd**. Alpine/OpenRC is not
+  supported by these installation tools.
+- Run installation and management commands as root. The examples use `sudo`;
+  omit it if you are already logged in as root.
+- Have Bash, curl, CA certificates, tar, sha256sum, flock (util-linux), and
+  Python 3.8+ available. The installer can install missing Python with apt-get,
+  dnf, or yum. Self-signed certificates also need OpenSSL; the wizard can
+  install it with those package managers.
+- Create the node in your panel first. Have its **panel URL, backend API key,
+  node ID, protocol, and security mode** ready. Elise reads the listening port
+  and protocol settings from the panel; it does not create the panel entry.
+- Allow the node's listening port through your firewall: TCP for VLESS, VMess,
+  and AnyTLS; UDP for Hysteria 1/2. Automatic certificates also need TCP port 80.
+
+A panel node must have only one backend owner. If V2bX already manages this
+node, remove its assignment before adding it to Elise. To move an existing
+`v2bx elise` installation, use the [migration guide](docs/migration.md).
+
+### Choose your panel type
+
+For [phungvanquy/v2board-new](https://github.com/phungvanquy/v2board-new), choose
+the value that matches **where you created the node in the panel**:
+
+| Panel or node section | `--panel-type` value |
+| --- | --- |
+| V2Board: unified **V2Node** section | `v2board` (default) |
+| V2Board: separate **VLESS, VMess, AnyTLS, or Hysteria** sections | `v2board-uniproxy` |
+| XBoard | `xboard` |
+| XiaoV2Board | `xiaov2board` |
+| PPanel | `ppanel` |
+| SSPanel | `sspanel` |
+
+`--node-type` is the node's protocol: `vless`, `vmess`, `anytls`, `hysteria`
+(Hysteria 1), or `hysteria2`. For example, a VLESS node in the separate VLESS
+section needs **both** `--node-type=vless` and `--panel-type=v2board-uniproxy`.
+A VLESS node in V2Node uses `--node-type=vless --panel-type=v2board`.
+
+Node IDs can overlap between sections. Use the ID from the selected section;
+Elise does not search other sections if it cannot find the node.
+
+### Install Elise
+
+Install the [latest stable release](https://github.com/phungvanquy/elise/releases/latest):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/phungvanquy/elise/refs/heads/main/install.sh -o /tmp/elise-install.sh &&
 sudo bash /tmp/elise-install.sh install
 ```
 
-For a reproducible version, pin both the bootstrap script and release:
+This installs the program and `elisectl` manager **without creating a node**.
+Next, [add your first node](#add-and-manage-nodes). The `elise` command is the
+core executable; `elisectl` configures nodes and manages their services.
+
+To install a specific version, pin both the bootstrap script and release.
+For example, to install v1.0.8:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/phungvanquy/elise/refs/tags/v1.0.8/install.sh -o /tmp/elise-install.sh &&
@@ -34,13 +78,14 @@ sudo bash /tmp/elise-install.sh install v1.0.8
 The installer verifies the release archive's SHA-256 checksum and installs the
 binary, manager, service template, and migration tools from that same archive.
 It checks that the Rust binary version matches the requested release tag.
-Without node options, installation creates no nodes. Legacy V2bX-managed
-services are not started by installation.
+Legacy V2bX-managed services are not started by installation.
 
 ### Install and start a node in one command
 
-Install the latest stable release and start a VLESS node configured with REALITY
-or no TLS in the panel:
+As an alternative to installing and then running `elisectl add`, you can do
+both together. This example uses node **123 in the separate VLESS section**,
+configured with **REALITY or no TLS** in the panel. Replace the example URL,
+key, and node ID with your panel's values:
 
 ```bash
 curl -fsSL \
@@ -49,38 +94,14 @@ curl -fsSL \
     --panel-url='https://panel.example.com' \
     --api-key='REPLACE_WITH_PANEL_KEY' \
     --node-id=123 \
-    --node-type=vless
+    --node-type=vless \
+    --panel-type=v2board-uniproxy
 ```
 
-The arguments after `bash -s --` go to the installer. Change `--node-type` to
-match the panel node: `vless`, `vmess`, `anytls`, `hysteria`, or `hysteria2`.
-The type is required because a panel can reuse a node ID across protocols.
-The panel defaults to `v2board` for the panel's unified **V2Node** section.
-For nodes in the separate **VLESS, VMess, AnyTLS, or Hysteria** sections, add
-`--panel-type=v2board-uniproxy`. Both modes support the same wizard protocols.
-Node IDs belong to their selected section; Elise does not probe another section
-if the node is missing. Other adapters are `xboard`, `xiaov2board`, `ppanel`, and
-`sspanel`. The listen address defaults to
-`0.0.0.0`; override it with `--listen=::` or another IP address.
-
-If the panel node uses **certificate TLS**, append one of these sets of options
-to that command. AnyTLS and Hysteria 1/2 always require certificate TLS:
-
-```bash
-# Existing certificate and matching private key
---cert-mode=file --cert-file=/etc/ssl/elise/fullchain.pem --key-file=/etc/ssl/elise/privkey.pem
-
-# Automatic Let's Encrypt certificate and renewal
---cert-mode=http --domain=node.example.com --email=admin@example.com
-
-# Self-signed certificate; configure clients to trust it explicitly
---cert-mode=self-signed --domain=node.example.com
-```
-
-HTTP mode requires DNS to point at this server and inbound TCP port 80 to
-remain available. It registers an account under the
-[Let's Encrypt subscriber agreement](https://letsencrypt.org/repository/).
-REALITY uses the keys in the panel and does not take certificate options.
+For a V2Node entry, change the last option to `--panel-type=v2board`.
+For certificate TLS, include the [certificate options](#certificates) as well.
+The arguments after `bash -s --` go to the installer and use the same node
+options as `elisectl add`.
 
 Node options disable all prompts; both `--name=value` and `--name value` work.
 The installer checks the panel, free listener port, and certificate settings
@@ -90,50 +111,94 @@ An existing instance is never overwritten. If the first start fails, the new
 configuration and certificates remain for diagnosis; the command returns a
 failure and prints recovery instructions. The program installation remains.
 
-For automation, replace `--api-key=...` with
-`--api-key-file=/root/.config/elise/panel.key` to read a key from a file readable
-by root. Store only the key in that file and set its permissions to `0600`.
-This keeps the literal key out of command history and process arguments.
-
-After Elise is installed, add further nodes without reinstalling the program:
-
-```bash
-sudo elisectl add --panel-url='https://panel.example.com' --api-key-file=/root/.config/elise/panel.key --node-id=124 --node-type=hysteria2 --cert-mode=http --domain=hy2.example.com --email=admin@example.com
-```
-
 ## Add and manage nodes
 
-The `elise` command is the Rust executable. Use `elisectl` for installation and
-node service management:
+### Add a node with command-line options
+
+Use this after installing Elise, for your first node or any additional node.
+This example adds node **123 from the separate VLESS section**, configured
+with **REALITY or no TLS**. Replace the URL, key, and ID before running it:
 
 ```bash
-sudo elisectl add vless 123 v2board
-sudo elisectl add vmess 456 v2board-uniproxy
-sudo elisectl add anytls 789 ppanel
-sudo elisectl add hysteria 101 sspanel
-sudo elisectl add hysteria2 102 xiaov2board
+sudo elisectl add \
+  --panel-url='https://panel.example.com' \
+  --api-key='REPLACE_WITH_PANEL_KEY' \
+  --node-id=123 \
+  --node-type=vless \
+  --panel-type=v2board-uniproxy
+```
+
+For a VLESS node in the unified **V2Node** section, use this instead:
+
+```bash
+sudo elisectl add \
+  --panel-url='https://panel.example.com' \
+  --api-key='REPLACE_WITH_PANEL_KEY' \
+  --node-id=123 \
+  --node-type=vless \
+  --panel-type=v2board
+```
+
+Use the panel's base URL, without an API endpoint or query string. The API key
+is the panel's backend API key. `--node-type` and `--panel-type` must match
+the [protocol and panel section](#choose-your-panel-type).
+
+**Using any named option disables all prompts.** Supply all four required
+values: panel URL, API key, node ID, and node type. For a node using certificate
+TLS, also supply [certificate options](#certificates). Both `--name=value`
+and `--name value` work. The listen address defaults to `0.0.0.0` (all IPv4
+interfaces); add `--listen=::` or another IP address to change it.
+
+For automation, replace `--api-key=...` with
+`--api-key-file=/root/.config/elise/panel.key`. Create that file first, store
+only the key in it, and set its permissions to `0600`. The file must be readable
+by root. This keeps the literal key out of command history and process arguments.
+
+### Use the interactive wizard
+
+If you prefer prompts for the URL, key, listen address, and certificates, use
+positional arguments: `elisectl add <protocol> <node-id> [panel-type]`.
+For node 123 in the separate VLESS section:
+
+```bash
+sudo elisectl add vless 123 v2board-uniproxy
+```
+
+For V2Node, use `sudo elisectl add vless 123 v2board`. Omitting the panel type
+also selects `v2board`. Choose either the wizard or the command-line options
+above for the same node; existing instances are never overwritten.
+
+The wizard supports VLESS, VMess, AnyTLS, and Hysteria 1/2. Protocol aliases
+are `hysteria1`/`hy1` and `hy2`; panel aliases are `xiaov2b` and `sspanel-uim`.
+The panel must expose the requested protocol using its supported Elise adapter.
+Additional native core protocols can be configured manually; their presence
+in the source does not imply wizard support.
+
+### Check that the node started
+
+Adding a node checks the panel, security mode, and free listener port, then
+starts its service and enables it at boot. An instance is named
+`<protocol>-<node-id>`, so the VLESS examples above create **`vless-123`**:
+
+```bash
 sudo elisectl list
-sudo elisectl status hysteria2-102
-sudo elisectl log hysteria2-102
-sudo elisectl restart hysteria2-102
+sudo elisectl status vless-123
+sudo elisectl log vless-123
 elise --version
 ```
 
-The wizard asks for the panel URL, API key, listen address, and certificate
-settings. It checks the panel protocol, security mode, and listener port before
-starting the service. Panel selection defaults to `v2board` (unified V2Node); `xiaov2b` and
-`sspanel-uim` are aliases. Protocol aliases are `hysteria1`/`hy1` and `hy2`.
-The panel must expose the requested protocol using its supported Elise adapter.
-REALITY keys must be configured in the panel. REALITY destinations accept a hostname
-or IP with an optional port; the default is `tls_settings.server_port` or 443.
-For example, `visualstudio.microsoft.com` uses port 443. Invalid destinations
-are rejected while loading the node configuration.
+Look for `active (running)` in the status and `Node ready with panel users` in
+the logs. Then check the node in your panel and connect with a configured
+client; local startup checks do not verify external firewall rules or a client
+session. `elisectl log` shows the latest 100 journal lines. To follow new logs:
 
-The managed wizard supports VLESS, VMess, AnyTLS, and Hysteria 1/2. Additional
-native core protocols can be configured manually; their presence in the source
-does not imply wizard support. A panel node must have only one backend owner.
-If V2bX also runs on the server, remove that node from its configuration before
-adding it to Elise. Elise checks the default V2bX config when it exists.
+```bash
+sudo journalctl -u elise@vless-123.service -f
+```
+
+Use `sudo elisectl restart vless-123` after editing its configuration.
+Replace `vless-123` with your instance name in all management commands.
+See [installation troubleshooting](#installation-troubleshooting) if startup fails.
 
 | Item | Location |
 | --- | --- |
@@ -180,28 +245,98 @@ remain in effect; update `type` in an existing config to select one of these mod
 
 ## Certificates
 
-| Wizard mode | Required input | Renewal |
+Match the security mode configured in the panel:
+
+| Node security | Options to add to `elisectl add` or the installer |
+| --- | --- |
+| VLESS with REALITY | No certificate options; configure matching REALITY keys in the panel |
+| VLESS or VMess without TLS | No certificate options |
+| VLESS or VMess with certificate TLS | Choose one certificate mode below |
+| AnyTLS, Hysteria 1, or Hysteria 2 | Always choose one certificate mode below |
+
+REALITY destinations accept a hostname or IP with an optional port; the default
+is `tls_settings.server_port` or 443. For example, `visualstudio.microsoft.com`
+uses port 443. Invalid destinations are rejected when loading the configuration.
+
+For example, add a VLESS node from the separate VLESS section with automatic
+Let's Encrypt TLS. Set the node to certificate TLS in the panel first, point
+`node.example.com` at this server, and replace all example values:
+
+```bash
+sudo elisectl add \
+  --panel-url='https://panel.example.com' \
+  --api-key='REPLACE_WITH_PANEL_KEY' \
+  --node-id=123 \
+  --node-type=vless \
+  --panel-type=v2board-uniproxy \
+  --cert-mode=http \
+  --domain=node.example.com \
+  --email=admin@example.com
+```
+
+For a separate Hysteria 2 node, use `--node-type=hysteria2` and that node's ID.
+For a V2Node entry, use `--panel-type=v2board`.
+
+Choose **one** of these option sets. With existing files or a self-signed
+certificate, replace the example's `--cert-mode`, `--domain`, and `--email`
+lines with the matching set:
+
+| Certificate mode | Command-line options | Renewal |
 | --- | --- | --- |
-| Existing files | Absolute paths to a PEM chain and matching unencrypted key | External tool; restart the instance from its deploy hook |
-| Automatic HTTP-01 | Domain and account email | Elise renews and reloads the listener |
-| Persistent self-signed | TLS hostname | Replace before its 365-day expiry; explicitly trust it in clients |
+| Existing files | `--cert-mode=file --cert-file=/etc/ssl/elise/fullchain.pem --key-file=/etc/ssl/elise/privkey.pem` | External tool; restart the instance from its deploy hook |
+| Automatic Let's Encrypt | `--cert-mode=http --domain=node.example.com --email=admin@example.com` | Elise renews and reloads the listener |
+| Self-signed certificate | `--cert-mode=self-signed --domain=node.example.com` | Replace before its 365-day expiry; explicitly trust it in clients |
+
+The interactive wizard asks for the same information. Existing-file mode
+requires absolute paths to a PEM certificate chain and matching unencrypted
+private key.
 
 HTTP-01 requires DNS to point at this server and public inbound TCP port 80 to
 remain available. Proxy TCP listeners must use another port. The wizard checks
 local DNS and port availability; it cannot verify external firewall/NAT rules.
+HTTP mode registers an account under the
+[Let's Encrypt subscriber agreement](https://letsencrypt.org/repository/).
 DNS-01 is not built into the wizard; externally issued certificates work with
-existing-file mode. AnyTLS and both Hysteria versions require TLS certificates;
-Hysteria listeners use UDP. Startup can take up to five minutes during issuance.
+existing-file mode. Hysteria listeners use UDP. Startup can take up to five
+minutes during issuance.
 
 External renewal hooks should run `elisectl restart <instance>`. Automatic
 renewal checks run every 12 hours and renew within 30 days of expiry; reloading
 can interrupt sessions. See [protocol notes](docs/protocol-notes.md) for native
 TLS settings, Hysteria, online IP limits, and XHTTP interoperability.
 
+## Installation troubleshooting
+
+| Message or symptom | What to check |
+| --- | --- |
+| `elisectl: command not found` | Run the [installer](#install-elise) first. The manager is installed at `/usr/local/bin/elisectl`; ensure `/usr/local/bin` is in your PATH. |
+| `unknown node option` or an unsupported panel type | Check `elisectl add --help`. If your installed version lacks these options, run `sudo elisectl update`. |
+| Cannot fetch panel configuration, or node not found | Check the base URL, backend API key, and node ID. For V2Board, confirm whether the entry is in V2Node (`v2board`) or a separate protocol section (`v2board-uniproxy`). |
+| `panel returned …, expected …` | Set `--node-type` to the protocol configured for that node and confirm the selected panel section. |
+| `this node requires TLS` | Supply a complete [certificate option set](#certificates), or use the interactive wizard. Named options disable prompts. |
+| `cannot bind …` / port already in use | Check the panel's listening port and stop or reconfigure the service already using it. |
+| HTTP certificate preflight or issuance fails | Point the domain's A/AAAA records at this server, allow public inbound TCP port 80, and keep port 80 free for certificate issuance and renewal. |
+| `already exists` | Inspect the existing instance with `sudo elisectl status vless-123`; edit its config and restart it instead of adding it again. Substitute your actual instance name. |
+| Service runs but clients cannot connect | Check the node's TCP/UDP port in the firewall, client settings, panel users, and node logs. |
+
+If the first start fails, Elise retains the new configuration and certificates
+and prints their location. For `vless-123`, inspect the logs with
+`sudo elisectl log vless-123`, fix the configuration at
+`/etc/elise/instances/vless-123/elise.conf`, then retry:
+
+```bash
+sudo systemctl enable --now elise@vless-123.service
+```
+
+Use your actual instance name. There is no need to reinstall Elise or add the
+same node again.
+
 ## Logs and debugging
 
-Use `elisectl log <instance>` to follow a node's systemd journal. The default
-`log_level=info` records startup, configuration changes, and failures. Routine
+Use `sudo elisectl log <instance>` to view the latest 100 lines of a node's
+systemd journal, or `sudo journalctl -u elise@<instance>.service -f` to follow
+new entries. The default `log_level=info` records startup, configuration changes,
+and failures. Routine
 connections, successful user polls, and handshake details use `debug`. To investigate
 an issue, temporarily set `log_level=debug` in the instance's `elise.conf` and restart
 it; return to `info` afterwards. `RUST_LOG` overrides this setting when present.
