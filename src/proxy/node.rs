@@ -375,7 +375,7 @@ impl NodeRunner {
                                         if let Ok(text) = resp.text().await {
                                             let cfg = RoutesConfig::parse_content(&text);
                                             runner.reload_routes(cfg);
-                                            info!("Reloaded remote routes from {}", url);
+                                            tracing::debug!("Reloaded remote routes from {}", url);
                                         }
                                     }
                                     _ => {
@@ -395,7 +395,7 @@ impl NodeRunner {
                                     if resp.status().is_success() {
                                         if let Ok(text) = resp.text().await {
                                             runner.audit.reload_block_list(&text);
-                                            info!("Reloaded remote block_list from {}", url);
+                                            tracing::debug!("Reloaded remote block_list from {}", url);
                                         }
                                     }
                                 }
@@ -405,7 +405,7 @@ impl NodeRunner {
                                     if resp.status().is_success() {
                                         if let Ok(text) = resp.text().await {
                                             runner.audit.reload_white_list(&text);
-                                            info!("Reloaded remote white_list from {}", url);
+                                            tracing::debug!("Reloaded remote white_list from {}", url);
                                         }
                                     }
                                 }
@@ -886,7 +886,7 @@ impl NodeRunner {
         let mut synced = None;
         match self.panel_client.get_users(self.node_id).await {
             Ok(users) => {
-                info!(
+                tracing::debug!(
                     "Node {}: Synced {} users from panel",
                     self.node_id,
                     users.len()

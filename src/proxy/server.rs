@@ -111,9 +111,10 @@ impl MasterServer {
             self.global_config.fake_sni.clone(),
         ));
 
-        let audit_logger = Arc::new(AuditLogger::new(
+        let audit_logger = Arc::new(AuditLogger::with_limits(
             self.global_config.audit_log_file.as_deref(),
-        ));
+            crate::observability::rolling::LogLimits::from_config(&self.global_config),
+        )?);
         let clickhouse_logger = Arc::new(ClickHouseLogger::new(
             self.global_config.clickhouse_enabled,
             self.global_config.clickhouse_addr.clone(),
@@ -202,6 +203,7 @@ impl MasterServer {
             let _ = h.await;
         }
 
+        tokio::join!(audit_logger.shutdown(), clickhouse_logger.shutdown());
         ip_user_cache.save_to_disk();
 
         if let Some(message) = failure {

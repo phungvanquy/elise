@@ -144,7 +144,7 @@ impl Inbound for VlessInbound {
         info!(
             "VLESS inbound listening on {} (transport: {:?}, security: {:?}, encryption: {:?})",
             bind_addr,
-            node_config.stream.transport,
+            node_config.stream.transport.transport_type(),
             node_config.stream.security,
             node_config.encryption
         );
@@ -541,7 +541,7 @@ async fn perform_vless_stream_handshake(
         if !is_tcp || !is_tls_or_reality {
             warn!(
                 "VLESS: Vision flow requested on incompatible transport/security ({:?}/{:?}) from {}",
-                stream_settings.transport, stream_settings.security, remote_addr
+                stream_settings.transport.transport_type(), stream_settings.security, remote_addr
             );
             return Ok(None);
         }

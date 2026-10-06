@@ -156,7 +156,7 @@ async fn handle_connection(
     decrypt_semaphore: Arc<tokio::sync::Semaphore>,
     vmess_defense: Arc<crate::security::AttackDefenseManager>,
 ) -> std::io::Result<()> {
-    info!("VMess: handle_connection accepted from {}", remote_addr);
+    tracing::debug!("VMess: handle_connection accepted from {}", remote_addr);
     let _ = stream.set_nodelay(true);
     let local_ip = stream.local_addr().ok().map(|s| s.ip());
 
@@ -234,7 +234,7 @@ async fn handle_connection(
             let decrypt_semaphore = sem_clone.clone();
             let vmess_defense = def_clone.clone();
             async move {
-                info!(
+                tracing::debug!(
                     "VMess: stream accepted, starting handshake for {}",
                     client_ip
                 );
@@ -276,7 +276,7 @@ async fn handle_connection(
                     }
                 };
 
-                info!(
+                tracing::debug!(
                     "VMess: handshake completed, entering forward_vmess_stream for {}",
                     client_ip
                 );
@@ -339,7 +339,7 @@ async fn perform_vmess_handshake(
         );
         return Ok(None);
     }
-    info!("VMess: read auth_id successfully from {}", client_ip);
+    tracing::debug!("VMess: read auth_id successfully from {}", client_ip);
 
     let now_sec = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -374,7 +374,7 @@ async fn perform_vmess_handshake(
 
     let (cmd_key, user) = match authed_entry {
         Some((k, u)) => {
-            info!("VMess: user auth succeeded: id={}, uuid={}", u.id, u.uuid);
+            tracing::debug!(user_id = u.id, "VMess authentication succeeded");
             vmess_defense.record_success(client_ip);
             ctx.ip_user_cache.insert(client_ip, u.id);
             (k, u)
@@ -431,7 +431,7 @@ async fn perform_vmess_handshake(
                 return Ok(None);
             }
         };
-    info!("VMess: decrypted header_len: {} bytes", header_len);
+    tracing::debug!("VMess: decrypted header_len: {} bytes", header_len);
 
     let mut header_buf = vec![0u8; header_len + 16];
     if let Err(e) = stream.read_exact(&mut header_buf).await {
@@ -454,9 +454,11 @@ async fn perform_vmess_handshake(
             }
         };
 
-    info!(
+    tracing::debug!(
         "VMess: request header parsed: target={}:{}, cmd={}",
-        req_header.target_host, req_header.target_port, req_header.command
+        req_header.target_host,
+        req_header.target_port,
+        req_header.command
     );
 
     if req_header.command == CMD_MUX {
@@ -485,7 +487,7 @@ async fn perform_vmess_handshake(
 
     stream.write_all(&resp_header_38b).await?;
     stream.flush().await?;
-    info!("VMess: sent 38-byte response header to {}", client_ip);
+    tracing::debug!("VMess: sent 38-byte response header to {}", client_ip);
 
     let target_host = req_header.target_host;
     let target_ip = req_header.target_ip;
@@ -590,9 +592,11 @@ async fn forward_vmess_stream(
     let rate_limiter = ctx.rate_limiter.clone();
     let user_id = user.id;
 
-    info!(
+    tracing::debug!(
         "VMess: forward_vmess_stream active for user {} -> {}:{}",
-        user_id, target_host, target_port
+        user_id,
+        target_host,
+        target_port
     );
 
     let is_auth_len = decrypter.is_authenticated_length();
@@ -629,7 +633,7 @@ async fn forward_vmess_stream(
             };
 
             if chunk_len == 0 {
-                info!("VMess: up_task received EOF marker from client");
+                tracing::debug!("VMess: up_task received EOF marker from client");
                 break;
             }
             if chunk_len > payload_buf.len() {
@@ -688,7 +692,7 @@ async fn forward_vmess_stream(
         if let Some(writer) = &mut out_write {
             let _ = writer.shutdown().await;
         }
-        info!(
+        tracing::debug!(
             "VMess: up_task completed with {} bytes transferred",
             total_up
         );
@@ -751,34 +755,35 @@ async fn forward_vmess_stream(
 
         enc_buf.clear();
         if let Ok(()) = encrypter.encrypt_chunk(&[], &mut enc_buf) {
-            info!(
+            tracing::debug!(
                 "VMess: down_task writing VMess EOF chunk (len={})",
                 enc_buf.len()
             );
             if let Err(e) = idle.run(client_write.write_all(&enc_buf)).await {
                 warn!("VMess: down_task write VMess EOF chunk failed: {:?}", e);
             } else {
-                info!("VMess: down_task write VMess EOF chunk succeeded");
+                tracing::debug!("VMess: down_task write VMess EOF chunk succeeded");
             }
         }
 
-        info!("VMess: down_task calling client_write.flush()...");
+        tracing::debug!("VMess: down_task calling client_write.flush()...");
         if let Err(e) = client_write.flush().await {
             warn!("VMess: down_task client_write.flush() failed: {:?}", e);
         } else {
-            info!("VMess: down_task client_write.flush() succeeded");
+            tracing::debug!("VMess: down_task client_write.flush() succeeded");
         }
 
-        info!("VMess: down_task calling client_write.shutdown()...");
+        tracing::debug!("VMess: down_task calling client_write.shutdown()...");
         if let Err(e) = client_write.shutdown().await {
             warn!("VMess: down_task client_write.shutdown() failed: {:?}", e);
         } else {
-            info!("VMess: down_task client_write.shutdown() succeeded");
+            tracing::debug!("VMess: down_task client_write.shutdown() succeeded");
         }
 
-        info!(
+        tracing::debug!(
             "VMess: down_task completed with {} bytes transferred in {} chunks",
-            total_down, chunk_count
+            total_down,
+            chunk_count
         );
     };
 
@@ -787,9 +792,11 @@ async fn forward_vmess_stream(
     } else {
         tokio::join!(up_task, down_task);
     }
-    info!(
+    tracing::debug!(
         "VMess: stream forwarding ended for user {}, total_up={}, total_down={}",
-        user_id, total_up, total_down
+        user_id,
+        total_up,
+        total_down
     );
 
     if total_down > 0 {

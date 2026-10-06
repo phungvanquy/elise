@@ -135,11 +135,21 @@ pub struct Http2TransportConfig {
     pub host: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum TransportSecurityConfig {
     None,
     Tls(TlsServerConfig),
     Reality(RealityServerConfig),
+}
+
+impl std::fmt::Debug for TransportSecurityConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::None => "None",
+            Self::Tls(_) => "TLS",
+            Self::Reality(_) => "REALITY",
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1245,10 +1255,19 @@ impl VlessFlow {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum VlessEncryptionConfig {
     None,
     Mlkem768X25519Plus(MlkemConfig),
+}
+
+impl std::fmt::Debug for VlessEncryptionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::None => "None",
+            Self::Mlkem768X25519Plus(_) => "MLKEM768-X25519",
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

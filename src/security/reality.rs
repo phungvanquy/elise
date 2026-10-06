@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 pub struct RealityKeyPair {
@@ -207,7 +207,7 @@ impl RealityServer {
             e
         })?;
 
-        info!(
+        debug!(
             "REALITY: Successfully authenticated and established TLS 1.3 with {}",
             remote_addr
         );
@@ -400,7 +400,7 @@ fn log_client_hello_info(handshake: &[u8]) {
                 sigs.push(u16::from_be_bytes([sig_data[s], sig_data[s + 1]]));
                 s += 2;
             }
-            info!("REALITY: ClientHello signature algorithms: {:04x?}", sigs);
+            debug!("REALITY: ClientHello signature algorithms: {:04x?}", sigs);
         }
         pos += ext_len;
     }
@@ -516,7 +516,7 @@ fn parse_x25519_key_share(handshake: &[u8]) -> Result<[u8; 32], String> {
                     sigs.push(u16::from_be_bytes([ext_data[s], ext_data[s + 1]]));
                     s += 2;
                 }
-                info!("REALITY: ClientHello signature algorithms: {:04x?}", sigs);
+                debug!("REALITY: ClientHello signature algorithms: {:04x?}", sigs);
             }
         }
 

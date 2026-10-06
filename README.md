@@ -15,7 +15,9 @@ with apt-get, dnf, or yum. Self-signed certificates also need OpenSSL; the wizar
 can install it with those package managers. Alpine/OpenRC is not supported by
 these installation tools.
 
-Install the latest stable release:
+Install the [latest stable release](https://github.com/phungvanquy/elise/releases/latest)
+(current release: **v1.0.6**). Omit the version argument to always install the
+latest stable release:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/phungvanquy/elise/refs/heads/main/install.sh -o /tmp/elise-install.sh &&
@@ -25,8 +27,8 @@ sudo bash /tmp/elise-install.sh install
 For a reproducible version, pin both the bootstrap script and release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/phungvanquy/elise/refs/tags/v1.0.5/install.sh -o /tmp/elise-install.sh &&
-sudo bash /tmp/elise-install.sh install v1.0.5
+curl -fsSL https://raw.githubusercontent.com/phungvanquy/elise/refs/tags/v1.0.6/install.sh -o /tmp/elise-install.sh &&
+sudo bash /tmp/elise-install.sh install v1.0.6
 ```
 
 The installer verifies the release archive's SHA-256 checksum and installs the
@@ -37,12 +39,13 @@ services are not started by installation.
 
 ### Install and start a node in one command
 
-For a VLESS node configured with REALITY or no TLS in the panel:
+Install the latest stable release and start a VLESS node configured with REALITY
+or no TLS in the panel:
 
 ```bash
 curl -fsSL \
-  https://raw.githubusercontent.com/phungvanquy/elise/refs/tags/v1.0.5/install.sh | \
-  sudo bash -s -- install v1.0.5 \
+  https://raw.githubusercontent.com/phungvanquy/elise/refs/heads/main/install.sh | \
+  sudo bash -s -- install \
     --panel-url='https://panel.example.com' \
     --api-key='REPLACE_WITH_PANEL_KEY' \
     --node-id=123 \
@@ -183,11 +186,50 @@ renewal checks run every 12 hours and renew within 30 days of expiry; reloading
 can interrupt sessions. See [protocol notes](docs/protocol-notes.md) for native
 TLS settings, Hysteria, online IP limits, and XHTTP interoperability.
 
+## Logs and debugging
+
+Use `elisectl log <instance>` to follow a node's systemd journal. The default
+`log_level=info` records startup, configuration changes, and failures. Routine
+connections, successful user polls, and handshake details use `debug`. To investigate
+an issue, temporarily set `log_level=debug` in the instance's `elise.conf` and restart
+it; return to `info` afterwards. `RUST_LOG` overrides this setting when present.
+Runtime logs redact panel tokens, ClickHouse passwords, and URL credentials/queries.
+VMess credentials and VLESS/REALITY private-key configurations are never logged.
+
+Optional `log_file` and `audit_log_file` use these limits independently:
+
+```ini
+log_max_size_mb=10
+log_max_files=5
+log_retention_days=7
+```
+
+Files rotate at the size limit or on a UTC day change. The active file plus numbered
+backups occupy at most **50 MiB per sink** with these defaults. Expired backups are
+removed on startup and rotation. Files use mode `0600` on Unix. A value of zero
+is clamped to one; `log_max_files` is capped at 100. Existing numbered backups beyond
+the limits are pruned. Older daily-named files from previous releases are not managed
+by this rotation policy. Runtime file output duplicates the console output.
+
+The systemd service limits bursts to 200 messages per 30 seconds. Journal disk size
+and retention remain controlled by the host's journald configuration; the file
+settings above do not limit the journal. An updated unit takes effect after reinstalling
+or updating Elise and restarting the instance.
+
+Audit logs are optional and include user IDs, client IPs, destinations, and traffic
+counts. Their JSON records are bounded in size and omit URL queries. File and
+ClickHouse queues hold at most 256 records each; overload drops records with warning
+summaries instead of delaying proxy traffic. Graceful shutdown attempts to drain them.
+ClickHouse checks HTTP status, uses a three-second request timeout, and retries failed
+batches up to three attempts. These are best-effort diagnostic logs: failures can lose
+records, and a retry after a lost acknowledgement can duplicate records. ClickHouse
+server-side retention/TTL must be configured on its table separately.
+
 ## Update, migration, and removal
 
 ```bash
 sudo elisectl update          # latest stable Elise release
-sudo elisectl update v1.0.5   # explicit Elise version
+sudo elisectl update v1.0.6   # explicit Elise version
 ```
 
 Updates restart only currently running standalone instances, preserve stopped

@@ -158,8 +158,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             }
 
-            init_logger(&cfg.log_level, cfg.log_file.as_deref());
-            tracing::info!("正在启动 Elise 原生核心服务 v{}...", elise::VERSION);
+            let _log_guard = init_logger(&cfg)?;
+            tracing::info!(version = elise::VERSION, "Starting Elise");
 
             let server = MasterServer::new(cfg);
             server.run().await?;
@@ -265,7 +265,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!("Elise 状态: 服务正常就绪。(在 Linux 系统上可使用 systemctl status elise 查看详细状态)");
         }
         Some(Commands::Log) => {
-            println!("Elise 日志: 默认日志目录为 /var/log/elise/ (可使用 journalctl -u elise -f 实时查看)");
+            println!("Elise logs: use elisectl log <instance> or journalctl -u elise@<instance>.service -f");
         }
         Some(Commands::Version) => {
             println!(

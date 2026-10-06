@@ -243,9 +243,13 @@ async fn handle_http_connection(
         }
     };
 
-    info!(
+    tracing::debug!(
         "[HTTP Proxy] conn={} peer={} user_id={} authenticated, method={} target={}",
-        conn_id, remote_addr, user.id, method, target
+        conn_id,
+        remote_addr,
+        user.id,
+        method,
+        target
     );
 
     let Some(device_guard) = ctx

@@ -46,6 +46,7 @@ pub struct GlobalConfig {
     pub audit_log_file: Option<PathBuf>,
     pub log_retention_days: u32,
     pub log_max_size_mb: u64,
+    pub log_max_files: u32,
 
     pub clickhouse_enabled: bool,
     pub clickhouse_addr: String,
@@ -177,7 +178,8 @@ impl Default for GlobalConfig {
             log_file: None,
             audit_log_file: None,
             log_retention_days: 7,
-            log_max_size_mb: 100,
+            log_max_size_mb: 10,
+            log_max_files: 5,
 
             clickhouse_enabled: false,
             clickhouse_addr: "http://127.0.0.1:8123".to_string(),
@@ -561,15 +563,20 @@ impl GlobalConfig {
             }
             "log_retention_days" | "log_file_retention_days" => {
                 if let Ok(n) = val.parse::<u32>() {
-                    self.log_retention_days = n;
+                    self.log_retention_days = n.max(1);
                 }
             }
             "log_max_size_mb" => {
                 if let Ok(n) = val.parse::<u64>() {
-                    self.log_max_size_mb = n;
+                    self.log_max_size_mb = n.max(1);
                 }
             }
 
+            "log_max_files" => {
+                if let Ok(n) = val.parse::<u32>() {
+                    self.log_max_files = n.clamp(1, 100);
+                }
+            }
             "clickhouse_enabled" | "access_log_enable" => {
                 self.clickhouse_enabled = val.eq_ignore_ascii_case("true") || val == "1"
             }
