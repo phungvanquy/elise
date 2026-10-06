@@ -27,6 +27,8 @@ pub struct XboardClient {
     base_url: String,
     token: String,
     node_type: Option<String>,
+    v2board_uniproxy: bool,
+    cached_nodes: RwLock<HashMap<u32, Arc<tokio::sync::Mutex<(Option<String>, Option<NodeInfo>)>>>>,
     cached_users: RwLock<HashMap<u32, Arc<tokio::sync::Mutex<(Option<String>, Vec<User>)>>>>,
 }
 
@@ -47,11 +49,34 @@ impl XboardClient {
             base_url: base_url.trim_end_matches('/').to_string(),
             token,
             node_type,
+            v2board_uniproxy: false,
+            cached_nodes: RwLock::new(HashMap::new()),
             cached_users: RwLock::new(HashMap::new()),
         }
     }
 
+    /// The protocol-specific API of phungvanquy/v2board-new has no status endpoint.
+    pub fn new_v2board_uniproxy(
+        base_url: String,
+        token: String,
+        node_type: Option<String>,
+    ) -> Self {
+        let mut client = Self::new_with_node_type(base_url, token, node_type);
+        client.v2board_uniproxy = true;
+        client
+    }
+
+    pub(super) fn is_v2board_uniproxy(&self) -> bool {
+        self.v2board_uniproxy
+    }
+
     fn endpoint(&self, path: &str, node_id: u32) -> std::io::Result<String> {
+        if self.v2board_uniproxy && self.node_type.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "v2board-uniproxy requires panel_node_type to select the protocol node table",
+            ));
+        }
         let mut url = reqwest::Url::parse(&format!("{}{}", self.base_url, path))
             .map_err(std::io::Error::other)?;
         {
@@ -70,7 +95,31 @@ impl XboardClient {
         node_id: u32,
     ) -> Result<NodeInfo, Box<dyn std::error::Error + Send + Sync>> {
         let url = self.endpoint("/api/v1/server/UniProxy/config", node_id)?;
-        let resp = self.client.get(&url).send().await?;
+        let cache = self
+            .cached_nodes
+            .write()
+            .entry(node_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new((None, None))))
+            .clone();
+        let mut cache = cache.lock().await;
+        let mut request = self.client.get(&url);
+        if let Some(etag) = cache.0.as_ref() {
+            request = request.header(IF_NONE_MATCH, etag);
+        }
+        let resp = request.send().await?;
+        if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
+            if cache.0.is_some() {
+                if let Some(info) = &cache.1 {
+                    return Ok(info.clone());
+                }
+            }
+            return Err("UniProxy returned 304 without a cached configuration".into());
+        }
+        let new_etag = resp
+            .headers()
+            .get("ETag")
+            .and_then(|h| h.to_str().ok())
+            .map(str::to_owned);
 
         if !resp.status().is_success() {
             return Err(format!("Xboard API returned status {}", resp.status()).into());
@@ -78,11 +127,27 @@ impl XboardClient {
 
         let val: Value = resp.json().await?;
         let data = val.get("data").unwrap_or(&val);
+        let server_port = data
+            .get("server_port")
+            .and_then(Value::as_u64)
+            .and_then(|p| u16::try_from(p).ok())
+            .filter(|p| *p != 0)
+            .ok_or("UniProxy configuration has no valid server_port")?;
 
         let version = data
             .get("version")
             .and_then(|v| v.as_u64())
             .map(|v| v as u32);
+
+        if self.v2board_uniproxy
+            && self
+                .node_type
+                .as_deref()
+                .is_some_and(|t| resolve_node_type(t, None) == "hysteria2")
+            && version.is_some_and(|v| v != 2)
+        {
+            return Err("Panel Hysteria version does not match configured hysteria2".into());
+        }
 
         let reported_type = data
             .get("server_type")
@@ -105,12 +170,15 @@ impl XboardClient {
         let node_type = resolve_node_type(node_type, version);
 
         let mut info = NodeInfo {
+            base_config: data
+                .get("base_config")
+                .filter(|v| !v.is_null())
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()?,
             id: node_id,
             node_type,
-            server_port: data
-                .get("server_port")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(443) as u16,
+            server_port,
             host: data.get("host").and_then(|v| v.as_str()).map(String::from),
             path: data.get("path").and_then(|v| v.as_str()).map(|p| {
                 if p.is_empty() || p.starts_with('/') {
@@ -269,6 +337,7 @@ impl XboardClient {
             info.short_ids = Some(ids);
         }
 
+        *cache = (new_etag, Some(info.clone()));
         Ok(info)
     }
 
@@ -361,7 +430,7 @@ impl XboardClient {
         node_id: u32,
         traffic: Vec<TrafficItem>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if traffic.is_empty() {
+        if traffic.is_empty() && !self.v2board_uniproxy {
             return Ok(());
         }
 
@@ -443,6 +512,9 @@ impl XboardClient {
         node_id: u32,
         status: &NodeStatusReport,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.v2board_uniproxy {
+            return Ok(());
+        }
         let v2_url = self.endpoint("/api/v2/server/report", node_id)?;
 
         let v2_payload = serde_json::json!({

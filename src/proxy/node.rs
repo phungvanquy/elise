@@ -337,12 +337,7 @@ impl NodeRunner {
             let runner = self.clone();
             let mut shutdown_sub = shutdown_rx.resubscribe();
             tokio::spawn(async move {
-                let report_secs = runner
-                    .node_config
-                    .read()
-                    .submit_interval
-                    .unwrap_or(runner.global_config.node_report_interval);
-                let interval = Duration::from_secs(report_secs.max(10));
+                let mut interval = runner.panel_interval(true);
                 let mut ticker = tokio::time::interval(interval);
                 loop {
                     tokio::select! {
@@ -350,6 +345,11 @@ impl NodeRunner {
                         _ = ticker.tick() => {
                             runner.report_data(false).await;
                             runner.prune_memory_leaks();
+                            let next = runner.panel_interval(true);
+                            if next != interval {
+                                interval = next;
+                                ticker = tokio::time::interval_at(tokio::time::Instant::now() + next, next);
+                            }
                         }
                     }
                 }
@@ -604,6 +604,62 @@ impl NodeRunner {
         })
     }
 
+    fn panel_interval(&self, push: bool) -> Duration {
+        let node = self.node_config.read();
+        let info = self.node_info.lock();
+        let base = info.as_ref().and_then(|i| i.base_config.as_ref());
+        let (local, default, keys, panel) = if push {
+            (
+                node.submit_interval,
+                self.global_config.node_report_interval,
+                ["submit_interval", "node_report_interval"],
+                base.and_then(|b| b.push_interval),
+            )
+        } else {
+            (
+                node.check_interval,
+                self.global_config.node_sync_interval,
+                ["check_interval", "node_sync_interval"],
+                base.and_then(|b| b.pull_interval),
+            )
+        };
+        let explicit = keys
+            .iter()
+            .any(|k| self.global_config.raw_properties.contains_key(*k));
+        Duration::from_secs(
+            local
+                .or(if explicit { Some(default) } else { panel })
+                .unwrap_or(default)
+                .max(10),
+        )
+    }
+
+    fn report_threshold(&self, online: bool) -> u64 {
+        let info = self.node_info.lock();
+        let base = info.as_ref().and_then(|i| i.base_config.as_ref());
+        let (key, local, panel) = if online {
+            (
+                "submit_alive_ip_min_traffic",
+                self.global_config.submit_alive_ip_min_traffic,
+                base.and_then(|b| b.device_online_min_traffic),
+            )
+        } else {
+            (
+                "submit_traffic_min_traffic",
+                self.global_config.submit_traffic_min_traffic,
+                base.and_then(|b| b.node_report_min_traffic),
+            )
+        };
+        if self.global_config.raw_properties.contains_key(key) {
+            local.saturating_mul(1024)
+        } else {
+            // V2Node's panel thresholds use decimal KB; Elise's local settings use KiB.
+            panel
+                .map(|n| n.saturating_mul(1000))
+                .unwrap_or_else(|| local.saturating_mul(1024))
+        }
+    }
+
     fn apply_node_routes(&self, node_info: &NodeInfo) {
         *self.node_info.lock() = Some(node_info.clone());
         self.reload_routes(RoutesConfig::load_from_file(
@@ -635,13 +691,8 @@ impl NodeRunner {
             }
         };
         let mut retired = tokio::task::JoinSet::new();
-        let interval = self
-            .node_config
-            .read()
-            .check_interval
-            .unwrap_or(self.global_config.node_sync_interval)
-            .max(10);
-        let mut ticker = tokio::time::interval(Duration::from_secs(interval));
+        let mut interval = self.panel_interval(false);
+        let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
         let mut watch_certificates = true;
         loop {
             let certificate_changed = tokio::select! {
@@ -691,10 +742,15 @@ impl NodeRunner {
                     warn!(node_id = self.node_id, error = %e, "Invalid node security update; keeping active configuration");
                     return;
                 }
+                let mut previous_listener = info.clone();
+                previous_listener.base_config = next.base_config.clone();
                 if !certificate_changed
-                    && serde_json::to_value(&next).ok() == serde_json::to_value(&info).ok()
+                    && serde_json::to_value(&next).ok()
+                        == serde_json::to_value(&previous_listener).ok()
                     && !active.task.is_finished()
                 {
+                    *self.node_info.lock() = Some(next.clone());
+                    info = next;
                     return;
                 }
                 let next_ctx = match self.inbound_context(&next) {
@@ -749,6 +805,11 @@ impl NodeRunner {
                 }
             };
             tokio::select! { biased; _ = shutdown.recv() => break, _ = update => {} }
+            let next = self.panel_interval(false);
+            if next != interval {
+                interval = next;
+                ticker = tokio::time::interval_at(tokio::time::Instant::now() + next, next);
+            }
         }
         active.stop().await;
         while retired.join_next().await.is_some() {}
@@ -872,8 +933,8 @@ impl NodeRunner {
     async fn report_data(&self, force: bool) {
         let _report_guard = self.report_lock.lock().await;
 
-        let min_traffic_bytes = self.global_config.submit_traffic_min_traffic * 1024;
-        let min_alive_bytes = self.global_config.submit_alive_ip_min_traffic * 1024;
+        let min_traffic_bytes = self.report_threshold(false);
+        let min_alive_bytes = self.report_threshold(true);
 
         let (items, active_users): (Vec<TrafficItem>, HashMap<u32, u64>) = {
             let buf = self.traffic_buffer.lock();
@@ -889,7 +950,7 @@ impl NodeRunner {
             (res, active)
         };
 
-        if !items.is_empty() {
+        if !items.is_empty() || self.panel_client.traffic_heartbeat() {
             if let Err(e) = self.save_pending().await {
                 error!(node_id = self.node_id, error = %e, "Traffic batch not persisted; report deferred");
                 return;
@@ -1036,6 +1097,37 @@ mod tests {
             )),
             Arc::new(IpUserCache::new(1, false, "")),
         )
+    }
+
+    #[test]
+    fn panel_reporting_settings_allow_explicit_local_overrides() {
+        let mut runner = runner("http://localhost".into());
+        *runner.node_info.lock() = Some(NodeInfo {
+            base_config: Some(crate::panel::types::PanelBaseConfig {
+                push_interval: Some(30),
+                pull_interval: Some(45),
+                node_report_min_traffic: Some(2),
+                device_online_min_traffic: Some(3),
+            }),
+            ..Default::default()
+        });
+        assert_eq!(runner.panel_interval(true), Duration::from_secs(30));
+        assert_eq!(runner.panel_interval(false), Duration::from_secs(45));
+        assert_eq!(runner.report_threshold(false), 2000);
+        assert_eq!(runner.report_threshold(true), 3000);
+        let global = Arc::make_mut(&mut runner.global_config);
+        global.node_report_interval = 80;
+        global
+            .raw_properties
+            .insert("submit_interval".into(), "80".into());
+        global.submit_traffic_min_traffic = 4;
+        global
+            .raw_properties
+            .insert("submit_traffic_min_traffic".into(), "4".into());
+        assert_eq!(runner.panel_interval(true), Duration::from_secs(80));
+        assert_eq!(runner.report_threshold(false), 4096);
+        runner.node_config.write().submit_interval = Some(5);
+        assert_eq!(runner.panel_interval(true), Duration::from_secs(10));
     }
 
     #[tokio::test]

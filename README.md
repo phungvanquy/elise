@@ -1,7 +1,8 @@
 # Elise
 
-Elise is a Rust node backend for XBoard, V2Board, XiaoV2Board, PPanel, and
-SSPanel. This repository owns its source, releases, installation tools, and
+Elise is a Rust node backend configured by default for
+[phungvanquy/v2board-new](https://github.com/phungvanquy/v2board-new), with optional
+support for XBoard, XiaoV2Board, PPanel, and SSPanel. This repository owns its source, releases, installation tools, and
 service management. Each installer-managed panel node runs in its own systemd
 service. V2bX is not required to build, install, or run Elise.
 
@@ -51,8 +52,12 @@ curl -fsSL \
 The arguments after `bash -s --` go to the installer. Change `--node-type` to
 match the panel node: `vless`, `vmess`, `anytls`, `hysteria`, or `hysteria2`.
 The type is required because a panel can reuse a node ID across protocols.
-The panel defaults to XBoard; use `--panel-type=v2board`, `xiaov2board`,
-`ppanel`, or `sspanel` for another adapter. The listen address defaults to
+The panel defaults to `v2board` for the panel's unified **V2Node** section.
+For nodes in the separate **VLESS, VMess, AnyTLS, or Hysteria** sections, add
+`--panel-type=v2board-uniproxy`. Both modes support the same wizard protocols.
+Node IDs belong to their selected section; Elise does not probe another section
+if the node is missing. Other adapters are `xboard`, `xiaov2board`, `ppanel`, and
+`sspanel`. The listen address defaults to
 `0.0.0.0`; override it with `--listen=::` or another IP address.
 
 If the panel node uses **certificate TLS**, append one of these sets of options
@@ -99,8 +104,8 @@ The `elise` command is the Rust executable. Use `elisectl` for installation and
 node service management:
 
 ```bash
-sudo elisectl add vless 123 xboard
-sudo elisectl add vmess 456 v2board
+sudo elisectl add vless 123 v2board
+sudo elisectl add vmess 456 v2board-uniproxy
 sudo elisectl add anytls 789 ppanel
 sudo elisectl add hysteria 101 sspanel
 sudo elisectl add hysteria2 102 xiaov2board
@@ -113,7 +118,7 @@ elise --version
 
 The wizard asks for the panel URL, API key, listen address, and certificate
 settings. It checks the panel protocol, security mode, and listener port before
-starting the service. Panel selection defaults to `xboard`; `xiaov2b` and
+starting the service. Panel selection defaults to `v2board` (unified V2Node); `xiaov2b` and
 `sspanel-uim` are aliases. Protocol aliases are `hysteria1`/`hy1` and `hy2`.
 The panel must expose the requested protocol using its supported Elise adapter.
 REALITY keys must be configured in the panel.
@@ -136,6 +141,27 @@ adding it to Elise. Elise checks the default V2bX config when it exists.
 
 Migrated nodes retain their original traffic-state location explicitly. Keep
 legacy configuration directories after migration; see the migration guide.
+
+## V2Board API compatibility
+
+| Panel node section | `type` / `--panel-type` | Config endpoint | Reporting node type |
+| --- | --- | --- | --- |
+| Unified V2Node (default) | `v2board` | `/api/v2/server/config` | `v2node` |
+| Separate protocol nodes | `v2board-uniproxy` | `/api/v1/server/UniProxy/config` | Configured protocol |
+
+Both modes fetch users and alive counts and submit traffic and online IPs through
+`/api/v1/server/UniProxy/{user,alivelist,push,alive}` with the panel token and node
+ID. No `/report` or `/status` calls are sent. Empty traffic reports keep idle
+nodes online in the panel. Config and user ETags avoid downloading unchanged data.
+Panel push/pull intervals and V2Node reporting thresholds apply unless explicitly
+overridden locally. Intervals have a 10-second minimum; panel thresholds use decimal
+KB, while local `submit_*_min_traffic` settings use KiB.
+
+For manual configs, set `type=v2board-uniproxy` and `panel_node_type` to the node's
+protocol; this mode requires a single node ID. The core also accepts `shadowsocks`,
+`trojan`, and `tuic` here. Unified V2Node configs can discover the protocol from the
+panel and retain support for multiple IDs. Existing explicit panel selections
+remain in effect; update `type` in an existing config to select one of these modes.
 
 ## Certificates
 

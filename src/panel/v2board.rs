@@ -10,6 +10,7 @@ pub struct V2BoardClient {
     client: Client,
     base_url: String,
     token: String,
+    cached_nodes: RwLock<HashMap<u32, Arc<tokio::sync::Mutex<(Option<String>, Option<NodeInfo>)>>>>,
     cached_users: RwLock<HashMap<u32, Arc<tokio::sync::Mutex<(Option<String>, Vec<User>)>>>>,
 }
 
@@ -24,6 +25,7 @@ impl V2BoardClient {
             client,
             base_url: base_url.trim_end_matches('/').to_string(),
             token: super::encode_query_key(&token),
+            cached_nodes: RwLock::new(HashMap::new()),
             cached_users: RwLock::new(HashMap::new()),
         }
     }
@@ -36,7 +38,33 @@ impl V2BoardClient {
             "{}/api/v2/server/config?node_type=v2node&node_id={}&token={}",
             self.base_url, node_id, self.token
         );
-        let resp = self.client.get(&url).send().await?;
+        let cache = self
+            .cached_nodes
+            .write()
+            .entry(node_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new((None, None))))
+            .clone();
+        let mut cache = cache.lock().await;
+        let mut request = self.client.get(&url);
+        if let Some(etag) = cache.0.as_ref() {
+            // This panel's V2 controller compares the bare SHA-1, although it
+            // returns a quoted ETag. UniProxy's user endpoint accepts quotes.
+            request = request.header(IF_NONE_MATCH, etag.trim_matches('"'));
+        }
+        let resp = request.send().await?;
+        if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
+            if cache.0.is_some() {
+                if let Some(info) = &cache.1 {
+                    return Ok(info.clone());
+                }
+            }
+            return Err("V2Board returned 304 without a cached configuration".into());
+        }
+        let new_etag = resp
+            .headers()
+            .get("ETag")
+            .and_then(|h| h.to_str().ok())
+            .map(str::to_owned);
 
         if !resp.status().is_success() {
             return Err(format!("V2Board API returned status {}", resp.status()).into());
@@ -44,6 +72,17 @@ impl V2BoardClient {
 
         let val: Value = resp.json().await?;
         let data = val.get("data").unwrap_or(&val);
+        // Authentication and missing-node failures are HTTP 200 in V2Node.
+        // Do not turn them into a default VLESS listener on port 443.
+        if val.get("status").and_then(Value::as_str) == Some("fail") {
+            return Err("V2Board rejected node configuration; check token and node ID".into());
+        }
+        let server_port = data
+            .get("server_port")
+            .and_then(Value::as_u64)
+            .and_then(|p| u16::try_from(p).ok())
+            .filter(|p| *p != 0)
+            .ok_or("V2Board configuration has no valid server_port")?;
 
         let ssr_type = data
             .get("server_type")
@@ -56,7 +95,8 @@ impl V2BoardClient {
             .or_else(|| data.get("server_type"))
             .or_else(|| data.get("type"))
             .and_then(|v| v.as_str())
-            .unwrap_or("vless")
+            .filter(|s| !s.is_empty())
+            .ok_or("V2Board configuration has no protocol")?
             .to_string();
         if let Some(ssr_type) = ssr_type {
             node_type = ssr_type.to_string();
@@ -141,12 +181,15 @@ impl V2BoardClient {
             .map(String::from);
 
         let info = NodeInfo {
+            base_config: data
+                .get("base_config")
+                .filter(|v| !v.is_null())
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()?,
             id: node_id,
             node_type,
-            server_port: data
-                .get("server_port")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(443) as u16,
+            server_port,
             host,
             path,
             server_name,
@@ -280,6 +323,7 @@ impl V2BoardClient {
             ..Default::default()
         };
 
+        *cache = (new_etag, Some(info.clone()));
         Ok(info)
     }
 
@@ -375,10 +419,6 @@ impl V2BoardClient {
         node_id: u32,
         traffic: Vec<TrafficItem>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if traffic.is_empty() {
-            return Ok(());
-        }
-
         let url = format!(
             "{}/api/v1/server/UniProxy/push?node_type=v2node&node_id={}&token={}",
             self.base_url, node_id, self.token

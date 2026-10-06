@@ -205,7 +205,7 @@ systemctl() {
             configure_panel(kind, {'server_port': server.node_port})
             instance = f'{kind}-9'
             result = run_helper(
-                service_setup + 'add_node "$1" 9; installed_instances; service_action restart "$2"',
+                service_setup + 'add_node "$1" 9 xboard; installed_instances; service_action restart "$2"',
                 config_root, requested, instance,
                 input=f'http://127.0.0.1:{server.server_port}\nkey+value\n127.0.0.1\n1\n{cert}\n{key}\n',
                 check=True,
@@ -237,7 +237,7 @@ print(os.environ['ELISE_TEST_NODE_INFO'])
 ''')
         panel_binary.chmod(0o755)
         native_setup = service_setup + 'binary=$2; '
-        for requested, platform in [('v2board', 'v2board'), ('xiaov2board', 'xiaov2board'),
+        for requested, platform in [('', 'v2board'), ('v2board', 'v2board'), ('v2board-uniproxy', 'v2board-uniproxy'), ('xiaov2board', 'xiaov2board'),
                                     ('xiaov2b', 'xiaov2board'), ('ppanel', 'ppanel'),
                                     ('sspanel', 'sspanel'), ('sspanel-uim', 'sspanel')]:
             with socket.socket() as sock:
@@ -247,7 +247,7 @@ print(os.environ['ELISE_TEST_NODE_INFO'])
             env['ELISE_TEST_PANEL'] = platform
             env['ELISE_TEST_NODE_INFO'] = json.dumps({'server_type': 'anytls', 'server_port': server.node_port, 'tls': 1})
             result = run_helper(
-                native_setup + 'add_node anytls 9 "$1"', config_root, requested, panel_binary,
+                native_setup + 'if [[ -n "$1" ]]; then add_node anytls 9 "$1"; else add_node anytls 9; fi', config_root, requested, panel_binary,
                 input=f'http://127.0.0.1:{server.server_port}\nkey+value\n127.0.0.1\n1\n{cert}\n{key}\n', check=True,
             )
             config = config_root / 'anytls-9/elise.conf'
@@ -285,7 +285,7 @@ print(os.environ['ELISE_TEST_NODE_INFO'])
                 configure_panel(kind, {'server_port': server.node_port})
                 instance = f'{kind}-9'
                 result = run_helper(
-                    service_setup + 'http_tls_preflight() { :; }; add_node "$1" 9',
+                    service_setup + 'http_tls_preflight() { :; }; add_node "$1" 9 xboard',
                     config_root, kind,
                     input=f'http://127.0.0.1:{server.server_port}\nkey+value\n127.0.0.1\n{mode}\nnode.example.com\nadmin@example.com\n',
                     check=True,
@@ -319,7 +319,7 @@ print(os.environ['ELISE_TEST_NODE_INFO'])
         # A failed first start retains the config/certificate for diagnosis and
         # retry; repeatedly deleting them can trigger unnecessary CA orders.
         result = run_helper(
-            service_setup + 'systemctl() { return 1; }; add_node anytls 9', config_root,
+            service_setup + 'systemctl() { return 1; }; add_node anytls 9 xboard', config_root,
             input=f'http://127.0.0.1:{server.server_port}\nkey+value\n127.0.0.1\n3\nnode.example.com\n',
         )
         assert result.returncode != 0 and 'retained' in result.stderr
@@ -328,7 +328,7 @@ print(os.environ['ELISE_TEST_NODE_INFO'])
 
         bad_key = Path(root) / 'bad-key.pem'
         bad_key.write_text('not a private key')
-        result = run_helper(service_setup + 'add_node anytls 9', config_root,
+        result = run_helper(service_setup + 'add_node anytls 9 xboard', config_root,
                             input=f'http://127.0.0.1:{server.server_port}\nkey+value\n127.0.0.1\n1\n{cert}\n{bad_key}\n')
         assert result.returncode != 0 and 'invalid TLS certificate' in result.stderr
         assert not (config_root / 'anytls-9').exists()
@@ -338,7 +338,7 @@ print(os.environ['ELISE_TEST_NODE_INFO'])
         def node_options(kind='vmess'):
             return [f'--node-type={kind}', '--node-id', '9',
                     f'--panel-url=http://127.0.0.1:{server.server_port}',
-                    '--api-key', 'key+value', '--listen=127.0.0.1']
+                    '--api-key', 'key+value', '--panel-type=xboard', '--listen=127.0.0.1']
 
         key_file = Path(root) / 'panel-key'
         key_file.write_text('key+value\n')
@@ -429,7 +429,7 @@ print(os.environ['ELISE_TEST_NODE_INFO'])
         # An API adapter's diagnostics can contain a credential-bearing URL.
         panel_binary.write_text("#!/bin/sh\necho 'failed token=key%2Bvalue raw=key+value' >&2\nexit 1\n")
         result = run_helper(native_setup + 'set -- "$1" "${@:3}"; add_node "$@"', config_root, '--panel-type=sspanel', panel_binary,
-                            *node_options('anytls'), input='')
+                            *[arg for arg in node_options('anytls') if arg != '--panel-type=xboard'], input='')
         assert result.returncode != 0 and '[redacted]' in result.stderr
         assert 'key+value' not in result.stderr and 'key%2Bvalue' not in result.stderr
 finally:

@@ -44,7 +44,17 @@ pub struct User {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PanelBaseConfig {
+    pub push_interval: Option<u64>,
+    pub pull_interval: Option<u64>,
+    pub node_report_min_traffic: Option<u64>,
+    pub device_online_min_traffic: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NodeInfo {
+    #[serde(default)]
+    pub base_config: Option<PanelBaseConfig>,
     pub id: u32,
     pub node_type: String,
     pub server_port: u16,

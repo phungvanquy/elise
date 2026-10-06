@@ -126,7 +126,7 @@ pub struct GlobalConfig {
 impl Default for GlobalConfig {
     fn default() -> Self {
         Self {
-            panel_type: "xboard".to_string(),
+            panel_type: "v2board".to_string(),
             panel_node_type: None,
             api_host: String::new(),
             api_key: String::new(),
@@ -284,22 +284,42 @@ impl GlobalConfig {
 
         if !matches!(
             cfg.panel_type.as_str(),
-            "xboard" | "v2board" | "xiaov2board" | "xiaov2b" | "ppanel" | "sspanel" | "sspanel-uim"
+            "xboard"
+                | "v2board"
+                | "v2board-uniproxy"
+                | "xiaov2board"
+                | "xiaov2b"
+                | "ppanel"
+                | "sspanel"
+                | "sspanel-uim"
         ) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "Unsupported panel type in configuration (type/panel_type)",
             ));
         }
+        if cfg.panel_type == "v2board-uniproxy" && cfg.panel_node_type.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "v2board-uniproxy requires panel_node_type",
+            ));
+        }
         if let Some(node_type) = cfg.panel_node_type.as_deref() {
             if !matches!(
                 node_type,
-                "vless" | "vmess" | "anytls" | "hysteria" | "hysteria2"
+                "vless"
+                    | "vmess"
+                    | "anytls"
+                    | "hysteria"
+                    | "hysteria2"
+                    | "shadowsocks"
+                    | "trojan"
+                    | "tuic"
             ) || cfg.node_ids.len() != 1
             {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "panel_node_type requires one node_id and vless, vmess, anytls, hysteria, or hysteria2",
+                    "panel_node_type requires one node_id and a supported protocol (vless, vmess, anytls, hysteria, hysteria2, shadowsocks, trojan, tuic)",
                 ));
             }
         }
@@ -891,10 +911,23 @@ mod tests {
     }
 
     #[test]
+    fn v2board_defaults_and_uniproxy_selection() {
+        assert_eq!(load_config("node_id=1\n").unwrap().panel_type, "v2board");
+        assert!(load_config("type=v2board-uniproxy\nnode_id=1\n").is_err());
+        for kind in ["shadowsocks", "trojan", "tuic"] {
+            assert!(load_config(&format!(
+                "type=v2board-uniproxy\nnode_id=1\npanel_node_type={kind}\n"
+            ))
+            .is_ok());
+        }
+    }
+
+    #[test]
     fn installer_panel_node_types_load_from_file() {
         for panel in [
             "xboard",
             "v2board",
+            "v2board-uniproxy",
             "xiaov2board",
             "xiaov2b",
             "ppanel",

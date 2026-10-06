@@ -23,6 +23,11 @@ pub(super) fn encode_query_key(key: &str) -> String {
 
 #[async_trait]
 pub trait PanelClient: Send + Sync {
+    /// V2Board uses /push as its heartbeat, including when no traffic is active.
+    fn traffic_heartbeat(&self) -> bool {
+        false
+    }
+
     async fn get_node_info(
         &self,
         node_id: u32,
@@ -62,6 +67,10 @@ pub trait PanelClient: Send + Sync {
 
 #[async_trait]
 impl PanelClient for XboardClient {
+    fn traffic_heartbeat(&self) -> bool {
+        self.is_v2board_uniproxy()
+    }
+
     async fn get_node_info(
         &self,
         node_id: u32,
@@ -105,6 +114,10 @@ impl PanelClient for XboardClient {
 
 #[async_trait]
 impl PanelClient for V2BoardClient {
+    fn traffic_heartbeat(&self) -> bool {
+        true
+    }
+
     async fn get_node_info(
         &self,
         node_id: u32,
@@ -252,6 +265,11 @@ pub fn create_panel_client_with_node_type(
     node_type: Option<&str>,
 ) -> Arc<dyn PanelClient> {
     let client: Arc<dyn PanelClient> = match panel_type.to_lowercase().as_str() {
+        "v2board-uniproxy" => Arc::new(XboardClient::new_v2board_uniproxy(
+            url.to_string(),
+            key.to_string(),
+            node_type.map(str::to_string),
+        )),
         "v2board" => Arc::new(V2BoardClient::new(url.to_string(), key.to_string())),
         "xiaov2board" | "xiaov2b" => {
             Arc::new(XiaoV2BoardClient::new(url.to_string(), key.to_string()))
@@ -285,6 +303,10 @@ struct TypedPanelClient {
 
 #[async_trait]
 impl PanelClient for TypedPanelClient {
+    fn traffic_heartbeat(&self) -> bool {
+        self.inner.traffic_heartbeat()
+    }
+
     async fn get_node_info(
         &self,
         node_id: u32,

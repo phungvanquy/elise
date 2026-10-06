@@ -74,7 +74,7 @@ Without node options, installs only the Elise program and management tools.
 With node options, also creates, enables, and starts one node without prompts.
 Required: --node-type (vless, vmess, anytls, hysteria, hysteria2), --panel-url,
           --node-id, and --api-key (or --api-key-file).
-Optional: --panel-type (default xboard), --listen (default 0.0.0.0).
+Optional: --panel-type (default v2board), --listen (default 0.0.0.0).
 For certificate TLS, choose one:
   --cert-mode=file --cert-file=/absolute/fullchain.pem --key-file=/absolute/key.pem
   --cert-mode=http --domain=node.example.com --email=admin@example.com

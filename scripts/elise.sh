@@ -58,7 +58,7 @@ normalize_kind() {
 }
 normalize_panel() {
     case "${1,,}" in
-        xboard|v2board|xiaov2board|ppanel|sspanel) printf '%s\n' "${1,,}" ;;
+        xboard|v2board|v2board-uniproxy|xiaov2board|ppanel|sspanel) printf '%s\n' "${1,,}" ;;
         xiaov2b) echo xiaov2board ;;
         sspanel-uim) echo sspanel ;;
         *) return 1 ;;
@@ -185,7 +185,7 @@ for line in pathlib.Path(sys.argv[1]).read_text().splitlines():
         key, value = line.split('=', 1)
         values[key.strip()] = value.strip()
 kind = values['panel_node_type']
-panel_type = values.get('type', 'xboard')
+panel_type = values.get('type', 'v2board')
 def redact(message):
     secret = values['panel_key']
     for variant in (urllib.parse.quote_plus(secret), urllib.parse.quote(secret, safe=''), secret):
@@ -474,7 +474,7 @@ parse_add_args() {
 }
 
 add_node() {
-    local kind="" node_id="" panel_type=xboard instance target panel_url="" panel_key="" listen=0.0.0.0 security port transport preflight tls_choice=""
+    local kind="" node_id="" panel_type=v2board instance target panel_url="" panel_key="" listen=0.0.0.0 security port transport preflight tls_choice=""
     local non_interactive=false cert_mode="" cert_file="" key_file="" domain="" email="" api_key_file=""
     local -a details
     parse_add_args "$@"
@@ -482,7 +482,7 @@ add_node() {
     [[ -x "$binary" ]] || die "install the Elise binary first"
     ensure_python
     kind=$(normalize_kind "$kind") || die "type must be vless, vmess, anytls, hysteria (hysteria1/hy1), or hysteria2 (hy2)"
-    panel_type=$(normalize_panel "$panel_type") || die "panel must be xboard, v2board, xiaov2board, ppanel, or sspanel"
+    panel_type=$(normalize_panel "$panel_type") || die "panel must be xboard, v2board, v2board-uniproxy, xiaov2board, ppanel, or sspanel"
     [[ "$node_id" =~ ^[1-9][0-9]*$ ]] || die "node ID must be a positive integer"
     python3 - "$node_id" <<'PY' || die "node ID exceeds Elise's u32 range"
 import sys
@@ -525,8 +525,6 @@ ip_user_cache_save_dir=$state_dir/$instance
 listen=$listen
 pprof_addr=off
 auto_tls=false
-check_interval=60
-submit_interval=60
 routes_file=$target/routes.toml
 dns_file=$target/dns.yml
 block_list_file=$target/blockList
@@ -632,9 +630,9 @@ Usage: elisectl install|update [Elise release version]
        elisectl migrate --from-v2bx [--dry-run]
 
 Hysteria aliases: hysteria1/hy1 -> hysteria; hy2 -> hysteria2.
-Panels: xboard (default), v2board, xiaov2board (xiaov2b), ppanel, sspanel (sspanel-uim).
+Panels: v2board (default, unified V2Node), v2board-uniproxy (protocol nodes), xboard, xiaov2board (xiaov2b), ppanel, sspanel (sspanel-uim).
 Node options (using any option disables all prompts):
-  --panel-type=NAME             Default: xboard
+  --panel-type=NAME             Default: v2board
   --listen=IP                   Default: 0.0.0.0
   --api-key-file=PATH            Read the key from a file instead of --api-key
   --cert-mode=file              Requires --cert-file=PATH and --key-file=PATH

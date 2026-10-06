@@ -26,7 +26,7 @@ fn inspect(panel: &str, requested: &str, payload: Value, status: &str) -> Output
         let url = reqwest::Url::parse(&format!("http://localhost{target}")).unwrap();
         let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
         let (path, key) = match platform.as_str() {
-            "xboard" => {
+            "xboard" | "v2board-uniproxy" => {
                 assert_eq!(query.get("node_type"), Some(&requested_type));
                 ("/api/v1/server/UniProxy/config", "token")
             }
@@ -89,6 +89,7 @@ fn installer_can_inspect_each_panel_and_select_the_requested_protocol() {
     for panel in [
         "xboard",
         "v2board",
+        "v2board-uniproxy",
         "xiaov2board",
         "ppanel",
         "sspanel",
@@ -158,6 +159,30 @@ fn sspanel_does_not_accept_a_failed_config_response() {
         "anytls",
         node("sspanel", "anytls", 1),
         "403 Forbidden",
+    );
+    assert!(!output.status.success());
+}
+
+#[test]
+fn v2board_rejects_http_200_business_failures_and_invalid_ports() {
+    for payload in [
+        json!({"status":"fail","message":"token is error"}),
+        json!({"protocol":"vless"}),
+        json!({"protocol":"vless","server_port":65536}),
+    ] {
+        assert!(!inspect("v2board", "vless", payload, "200 OK")
+            .status
+            .success());
+    }
+}
+
+#[test]
+fn uniproxy_hysteria_two_rejects_version_one_without_a_type_field() {
+    let output = inspect(
+        "v2board-uniproxy",
+        "hysteria2",
+        json!({"server_port":12345,"version":1}),
+        "200 OK",
     );
     assert!(!output.status.success());
 }
