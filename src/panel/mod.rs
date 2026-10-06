@@ -1,6 +1,7 @@
 pub mod ppanel;
 pub mod sspanel;
 pub mod types;
+mod uniproxy;
 pub mod v2board;
 pub mod xboard;
 pub mod xiaov2board;

@@ -368,47 +368,7 @@ impl V2BoardClient {
             .map(str::to_owned);
 
         let val: Value = resp.json().await?;
-        let user_list = val
-            .get("users")
-            .or_else(|| val.get("data"))
-            .and_then(|v| v.as_array());
-
-        if user_list.is_none() {
-            return Err("Panel user response has no users array".into());
-        }
-        let mut users = Vec::new();
-        if let Some(arr) = user_list {
-            for item in arr {
-                let id = item.get("id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                let uuid = item
-                    .get("uuid")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let speed_limit = crate::panel::types::speed_limit_bps(item.get("speed_limit"))?;
-                let device_limit = item
-                    .get("device_limit")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as u32;
-
-                users.push(User {
-                    id,
-                    uuid,
-                    speed_limit,
-                    device_limit,
-                    password: item
-                        .get("password")
-                        .and_then(|v| v.as_str())
-                        .map(String::from),
-                    method: item
-                        .get("method")
-                        .and_then(|v| v.as_str())
-                        .map(String::from),
-                    port: item.get("port").and_then(|v| v.as_u64()).map(|v| v as u16),
-                    flow: item.get("flow").and_then(|v| v.as_str()).map(String::from),
-                });
-            }
-        }
+        let users = super::uniproxy::users(&val)?;
 
         *cache = (new_etag, users.clone());
         Ok(users)
@@ -431,14 +391,7 @@ impl V2BoardClient {
 
         let resp = self.client.post(&url).json(&payload).send().await?;
 
-        if !resp.status().is_success() {
-            return Err(format!(
-                "V2Board API traffic report returned status {}",
-                resp.status()
-            )
-            .into());
-        }
-        Ok(())
+        super::uniproxy::acknowledge(resp).await
     }
 
     pub async fn report_online_devices(
@@ -460,13 +413,8 @@ impl V2BoardClient {
             payload.insert(item.user_id.to_string(), item.ips);
         }
 
-        self.client
-            .post(&url)
-            .json(&payload)
-            .send()
-            .await?
-            .error_for_status()?;
-        Ok(())
+        let resp = self.client.post(&url).json(&payload).send().await?;
+        super::uniproxy::acknowledge(resp).await
     }
 
     pub async fn get_user_alivelist(
@@ -485,20 +433,6 @@ impl V2BoardClient {
 
         let val: Value = resp.json().await?;
 
-        let mut res = HashMap::new();
-        let map_obj = val
-            .get("alive")
-            .or_else(|| val.get("data"))
-            .or(Some(&val))
-            .and_then(|v| v.as_object());
-
-        if let Some(map) = map_obj {
-            for (k, v) in map {
-                if let (Ok(uid), Some(cnt)) = (k.parse::<u32>(), v.as_u64()) {
-                    res.insert(uid, cnt as u32);
-                }
-            }
-        }
-        Ok(res)
+        Ok(super::uniproxy::alive(&val)?)
     }
 }

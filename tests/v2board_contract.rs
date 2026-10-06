@@ -1,4 +1,4 @@
-//! Wire contract from phungvanquy/v2board-new at 850fff5ced1edd966ced081ec9f1e4efefc683c0.
+//! Wire contract from phungvanquy/v2board-new at 032a69e08a04a9218b825f7d154d9b6833add9ba.
 use elise::panel::{
     create_panel_client_with_node_type, NodeStatusReport, OnlineDeviceItem, TrafficItem,
 };
@@ -315,5 +315,138 @@ async fn both_node_sections_use_only_supported_apis() {
                 .unwrap();
             server.await.unwrap();
         }
+    }
+}
+
+#[tokio::test]
+async fn invalid_users_do_not_replace_valid_snapshot_or_etag() {
+    for panel in ["v2board", "v2board-uniproxy"] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = create_panel_client_with_node_type(
+            panel,
+            &format!("http://{}", listener.local_addr().unwrap()),
+            "fixture",
+            Some("vless"),
+        );
+        let invalid = vec![
+            json!({"users":[{}]}),
+            json!({"users":[{"id":0,"uuid":"user"}]}),
+            json!({"users":[{"id":4294967296u64,"uuid":"user"}]}),
+            json!({"users":[{"id":7,"uuid":""}]}),
+            json!({"users":[{"id":7,"uuid":"user","device_limit":-1}]}),
+            json!({"users":[{"id":7,"uuid":"user","device_limit":4294967296u64}]}),
+            json!({"users":[{"id":7,"uuid":"user"},{"id":7,"uuid":"other"}]}),
+            json!({"users":[{"id":7,"uuid":"user"},{"id":8,"uuid":"user"}]}),
+        ];
+        let count = invalid.len();
+        let server = tokio::spawn(async move {
+            let valid = json!({"users":[{"id":7,"uuid":"user","speed_limit":8,"device_limit":1}]})
+                .to_string();
+            let mut replies = vec![("200 OK", "good", valid)];
+            for value in invalid {
+                replies.push(("200 OK", "bad", value.to_string()));
+                replies.push(("304 Not Modified", "good", String::new()));
+            }
+            replies.push(("200 OK", "empty", "{\"users\":[]}".into()));
+            for (index, (status, etag, body)) in replies.into_iter().enumerate() {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(socket.read_u8().await.unwrap());
+                }
+                let request = String::from_utf8(request).unwrap().to_lowercase();
+                if index > 0 {
+                    assert!(request.contains("if-none-match: \"good\"\r\n"));
+                }
+                socket.write_all(format!("HTTP/1.1 {status}\r\nETag: \"{etag}\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        assert_eq!(client.get_users(9).await.unwrap()[0].id, 7);
+        for _ in 0..count {
+            assert!(client.get_users(9).await.is_err());
+            assert_eq!(client.get_users(9).await.unwrap()[0].id, 7);
+        }
+        assert!(client.get_users(9).await.unwrap().is_empty());
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn alive_counts_and_report_acknowledgements_must_be_valid() {
+    for panel in ["v2board", "v2board-uniproxy"] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = create_panel_client_with_node_type(
+            panel,
+            &format!("http://{}", listener.local_addr().unwrap()),
+            "fixture",
+            Some("vless"),
+        );
+        let server = tokio::spawn(async move {
+            for body in [
+                "{\"error\":\"unavailable\"}",
+                "{\"alive\":null}",
+                "{\"alive\":{\"7\":-1}}",
+                "{\"alive\":{\"7\":4294967296}}",
+                "{\"alive\":{}}",
+                "{\"data\":false}",
+                "<html>login</html>",
+                "{\"data\":true}",
+                "{\"data\":false}",
+                "{\"data\":true}",
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(socket.read_u8().await.unwrap());
+                }
+                let request = String::from_utf8(request).unwrap();
+                let length = request
+                    .lines()
+                    .find_map(|line| {
+                        line.to_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                socket.read_exact(&mut vec![0; length]).await.unwrap();
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        for _ in 0..4 {
+            assert!(client.get_user_alivelist(9).await.is_err());
+        }
+        assert!(client.get_user_alivelist(9).await.unwrap().is_empty());
+        for expected in [false, false, true] {
+            assert_eq!(
+                client
+                    .report_traffic(
+                        9,
+                        vec![TrafficItem {
+                            user_id: 7,
+                            u: 10,
+                            d: 20
+                        }]
+                    )
+                    .await
+                    .is_ok(),
+                expected
+            );
+        }
+        for expected in [false, true] {
+            assert_eq!(
+                client
+                    .report_online_devices(
+                        9,
+                        vec![OnlineDeviceItem {
+                            user_id: 7,
+                            ips: vec![]
+                        }]
+                    )
+                    .await
+                    .is_ok(),
+                expected
+            );
+        }
+        server.await.unwrap();
     }
 }

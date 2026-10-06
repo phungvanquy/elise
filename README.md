@@ -159,6 +159,15 @@ Both modes fetch users and alive counts and submit traffic and online IPs throug
 `/api/v1/server/UniProxy/{user,alivelist,push,alive}` with the panel token and node
 ID. No `/report` or `/status` calls are sent. Empty traffic reports keep idle
 nodes online in the panel. Config and user ETags avoid downloading unchanged data.
+Malformed user/alive responses retain the last valid state. Traffic and online-IP
+reports are acknowledged only when the panel returns `data=true`; unsuccessful
+traffic batches remain pending for retry. The panel API has no idempotency key, so
+an accepted report whose response is lost can be counted again on retry. Node failure
+recovery uses cached config and users even when the panel is unavailable; failure to
+restore the listener exits the runner so systemd can restart it. Slow API calls do
+not accumulate bursts of catch-up polls. Routine heartbeats wait for listener readiness;
+shutdown still attempts to flush pending traffic.
+
 Panel push/pull intervals and V2Node reporting thresholds apply unless explicitly
 overridden locally. Intervals have a 10-second minimum; panel thresholds use decimal
 KB, while local `submit_*_min_traffic` settings use KiB.

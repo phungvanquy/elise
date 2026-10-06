@@ -43,6 +43,7 @@ pub struct NodeRunner {
     sys_collector: Arc<SystemCollector>,
     synced_user_count: Arc<AtomicU32>,
     user_sync_state: Mutex<(bool, u32)>,
+    readiness: tokio::sync::watch::Sender<bool>,
 }
 
 struct ActiveInbound {
@@ -131,6 +132,7 @@ impl NodeRunner {
             sys_collector: Arc::new(SystemCollector::new()),
             synced_user_count: Arc::new(AtomicU32::new(0)),
             user_sync_state: Mutex::new((false, 0)),
+            readiness: tokio::sync::watch::channel(false).0,
         }
     }
 
@@ -337,25 +339,8 @@ impl NodeRunner {
 
         let report_task = {
             let runner = self.clone();
-            let mut shutdown_sub = shutdown_rx.resubscribe();
-            tokio::spawn(async move {
-                let mut interval = runner.panel_interval(true);
-                let mut ticker = tokio::time::interval(interval);
-                loop {
-                    tokio::select! {
-                        _ = shutdown_sub.recv() => break,
-                        _ = ticker.tick() => {
-                            runner.report_data(false).await;
-                            runner.prune_memory_leaks();
-                            let next = runner.panel_interval(true);
-                            if next != interval {
-                                interval = next;
-                                ticker = tokio::time::interval_at(tokio::time::Instant::now() + next, next);
-                            }
-                        }
-                    }
-                }
-            })
+            let shutdown_sub = shutdown_rx.resubscribe();
+            tokio::spawn(async move { runner.run_reports(shutdown_sub).await })
         };
 
         let rules_sync_task = {
@@ -606,6 +591,51 @@ impl NodeRunner {
         })
     }
 
+    fn set_ready(&self, ready: bool) {
+        self.readiness.send_if_modified(|value| {
+            if *value == ready {
+                false
+            } else {
+                *value = ready;
+                true
+            }
+        });
+    }
+
+    async fn run_reports(&self, mut shutdown: broadcast::Receiver<()>) {
+        let mut readiness = self.readiness.subscribe();
+        let mut interval = self.panel_interval(true);
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            let readiness_changed = tokio::select! {
+                biased;
+                _ = shutdown.recv() => break,
+                result = readiness.changed() => {
+                    if result.is_err() { break; }
+                    true
+                }
+                _ = ticker.tick() => false,
+            };
+            if *readiness.borrow_and_update() {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.recv() => break,
+                    _ = self.report_data(false) => {}
+                }
+            }
+            self.prune_memory_leaks();
+            let next = self.panel_interval(true);
+            if next != interval {
+                interval = next;
+                ticker = tokio::time::interval_at(tokio::time::Instant::now() + next, next);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            } else if readiness_changed {
+                ticker.reset();
+            }
+        }
+    }
+
     fn panel_interval(&self, push: bool) -> Duration {
         let node = self.node_config.read();
         let info = self.node_info.lock();
@@ -680,11 +710,11 @@ impl NodeRunner {
 
     async fn run_inbound(
         self: Arc<Self>,
-        mut info: NodeInfo,
+        info: NodeInfo,
         mut shutdown: broadcast::Receiver<()>,
-        mut certificate_updates: tokio::sync::watch::Receiver<()>,
+        certificate_updates: tokio::sync::watch::Receiver<()>,
     ) {
-        let Some(mut users) = self.initial_users(&mut shutdown).await else {
+        let Some(users) = self.initial_users(&mut shutdown).await else {
             return;
         };
         tokio::select! {
@@ -697,26 +727,45 @@ impl NodeRunner {
             _ = shutdown.recv() => return,
             result = self.launch_inbound(&info, &users) => result,
         };
-        let mut active = match launched {
+        let active = match launched {
             Ok(active) => active,
             Err(e) => {
                 error!(node_id = self.node_id, error = %e, "Inbound startup failed");
                 return;
             }
         };
+        self.set_ready(true);
         info!(
             node_id = self.node_id,
             user_count = users.len(),
             "Node ready with panel users"
         );
+        self.run_active_inbound(info, users, active, shutdown, certificate_updates)
+            .await;
+    }
+
+    async fn run_active_inbound(
+        self: Arc<Self>,
+        mut info: NodeInfo,
+        mut users: Vec<User>,
+        mut active: ActiveInbound,
+        mut shutdown: broadcast::Receiver<()>,
+        mut certificate_updates: tokio::sync::watch::Receiver<()>,
+    ) {
         let mut retired = tokio::task::JoinSet::new();
         let mut interval = self.panel_interval(false);
         let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut watch_certificates = true;
         loop {
-            let certificate_changed = tokio::select! {
+            let (certificate_changed, listener_exited) = tokio::select! {
                 biased;
                 _ = shutdown.recv() => break,
+                result = &mut active.task => {
+                    self.set_ready(false);
+                    warn!(node_id = self.node_id, ?result, "Listener stopped; restoring cached configuration and users");
+                    (false, true)
+                },
                 result = retired.join_next(), if !retired.is_empty() => {
                     if let Some(Err(e)) = result { warn!(error = %e, "Retired inbound task failed"); }
                     continue;
@@ -726,13 +775,14 @@ impl NodeRunner {
                         watch_certificates = false;
                         continue;
                     }
-                    true
+                    (true, false)
                 }
-                _ = ticker.tick() => false,
+                _ = ticker.tick() => (false, false),
             };
+            let mut listener_unavailable = listener_exited;
             let update = async {
                 // Renewal must reach the listener even during a panel outage.
-                let mut next = if certificate_changed {
+                let mut next = if certificate_changed || listener_exited {
                     info.clone()
                 } else {
                     if let Some(synced) = self.sync_users(&active.inbound).await {
@@ -764,6 +814,7 @@ impl NodeRunner {
                 let mut previous_listener = info.clone();
                 previous_listener.base_config = next.base_config.clone();
                 if !certificate_changed
+                    && !listener_exited
                     && serde_json::to_value(&next).ok()
                         == serde_json::to_value(&previous_listener).ok()
                     && !active.task.is_finished()
@@ -785,6 +836,7 @@ impl NodeRunner {
                 let same_address =
                     next_ctx.port == old_ctx.port && next_ctx.listen_addr == old_ctx.listen_addr;
                 if same_address {
+                    self.set_ready(false);
                     active.stop().await;
                 }
                 let candidate = if same_address {
@@ -794,6 +846,8 @@ impl NodeRunner {
                 };
                 match candidate {
                     Ok(candidate) => {
+                        self.set_ready(true);
+                        listener_unavailable = false;
                         let mut old = std::mem::replace(&mut active, candidate);
                         retired.spawn(async move {
                             old.stop().await;
@@ -807,6 +861,7 @@ impl NodeRunner {
                             node_id = self.node_id,
                             port = info.server_port,
                             certificate_changed,
+                            listener_exited,
                             "Node configuration reloaded"
                         );
                     }
@@ -814,8 +869,13 @@ impl NodeRunner {
                         warn!(node_id = self.node_id, error = %e, "Node update failed; keeping previous configuration");
                         if same_address {
                             match self.launch_replacement(&info, &users).await {
-                                Ok(previous) => active = previous,
+                                Ok(previous) => {
+                                    self.set_ready(true);
+                                    active = previous;
+                                    listener_unavailable = false;
+                                }
                                 Err(e) => {
+                                    listener_unavailable = true;
                                     error!(node_id = self.node_id, error = %e, "Failed to restore previous listener")
                                 }
                             }
@@ -824,12 +884,17 @@ impl NodeRunner {
                 }
             };
             tokio::select! { biased; _ = shutdown.recv() => break, _ = update => {} }
+            if listener_unavailable {
+                break; // Let the master/systemd restart a node that cannot recover.
+            }
             let next = self.panel_interval(false);
             if next != interval {
                 interval = next;
                 ticker = tokio::time::interval_at(tokio::time::Instant::now() + next, next);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             }
         }
+        self.set_ready(false);
         active.stop().await;
         while retired.join_next().await.is_some() {}
     }
@@ -1146,7 +1211,10 @@ mod tests {
             1,
             Arc::new(crate::panel::SSPanelClient::new(url, "fixture".into())),
             Arc::new(config),
-            NodeConfig::default(),
+            NodeConfig {
+                node_id: 1,
+                ..Default::default()
+            },
             Arc::new(Router::new(Default::default(), dialer, geo.clone())),
             Arc::new(RateLimiter::new()),
             Arc::new(ConnectionLimiter::new()),
@@ -1170,6 +1238,7 @@ mod tests {
     struct UserPanel {
         replies: Mutex<std::collections::VecDeque<Option<Vec<User>>>>,
         calls: AtomicU32,
+        reports: AtomicU32,
     }
 
     impl UserPanel {
@@ -1177,12 +1246,16 @@ mod tests {
             Arc::new(Self {
                 replies: Mutex::new(replies.into()),
                 calls: AtomicU32::new(0),
+                reports: AtomicU32::new(0),
             })
         }
     }
 
     #[async_trait::async_trait]
     impl PanelClient for UserPanel {
+        fn traffic_heartbeat(&self) -> bool {
+            true
+        }
         async fn get_node_info(
             &self,
             _: u32,
@@ -1205,6 +1278,7 @@ mod tests {
             _: u32,
             _: Vec<TrafficItem>,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.reports.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
         async fn report_online_devices(
@@ -1214,6 +1288,37 @@ mod tests {
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_waits_for_readiness_and_resumes_without_duplicate_tick() {
+        let panel = UserPanel::new(vec![]);
+        let mut runner = runner("http://unused".into());
+        runner.panel_client = panel.clone();
+        let runner = Arc::new(runner);
+        let (shutdown, rx) = broadcast::channel(1);
+        let worker = runner.clone();
+        let task = tokio::spawn(async move { worker.run_reports(rx).await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(120)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(panel.reports.load(Ordering::Relaxed), 0);
+        runner.set_ready(true);
+        tokio::task::yield_now().await;
+        assert_eq!(panel.reports.load(Ordering::Relaxed), 1);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(panel.reports.load(Ordering::Relaxed), 1);
+        runner.set_ready(false);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(120)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(panel.reports.load(Ordering::Relaxed), 1);
+        runner.set_ready(true);
+        tokio::task::yield_now().await;
+        assert_eq!(panel.reports.load(Ordering::Relaxed), 2);
+        shutdown.send(()).unwrap();
+        task.await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -1311,6 +1416,59 @@ mod tests {
             shutdown.send(()).unwrap();
             task.await.unwrap();
             let _ = std::fs::remove_dir_all(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stopped_listener_recovers_cached_users_during_panel_outage() {
+        tokio::time::timeout(Duration::from_secs(8), async {
+            let mut runner = runner("http://unused".into());
+            let panel = UserPanel::new(vec![]);
+            runner.panel_client = panel.clone();
+            let dir = std::env::temp_dir().join(format!("elise-recover-{}", uuid::Uuid::new_v4()));
+            Arc::get_mut(&mut runner.global_config).unwrap().nodes_dir = Some(dir.clone());
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            let info = NodeInfo {
+                node_type: "socks".into(),
+                server_port: port,
+                listen_ip: Some("127.0.0.1".into()),
+                ..Default::default()
+            };
+            let users = vec![User {
+                id: 42,
+                uuid: "test".into(),
+                password: Some("pass".into()),
+                ..Default::default()
+            }];
+            let active = runner.launch_inbound(&info, &users).await.unwrap();
+            assert_eq!(socks_auth(port).await, 0);
+            active.task.abort();
+            while !active.task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            let (shutdown, rx) = broadcast::channel(1);
+            let (_updates, certificate_rx) = tokio::sync::watch::channel(());
+            let task = tokio::spawn(Arc::new(runner).run_active_inbound(
+                info,
+                users,
+                active,
+                rx,
+                certificate_rx,
+            ));
+            while !dir.join("node_1.conf").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(socks_auth(port).await, 0);
+            assert_eq!(panel.calls.load(Ordering::Relaxed), 0);
+            shutdown.send(()).unwrap();
+            task.await.unwrap();
+            std::fs::remove_dir_all(dir).unwrap();
         })
         .await
         .unwrap();

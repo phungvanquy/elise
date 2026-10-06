@@ -379,6 +379,11 @@ impl XboardClient {
             .map(str::to_owned);
 
         let val: Value = resp.json().await?;
+        if self.v2board_uniproxy {
+            let users = super::uniproxy::users(&val)?;
+            *cache = (new_etag, users.clone());
+            return Ok(users);
+        }
         let user_list = val
             .get("users")
             .or_else(|| val.get("data"))
@@ -442,6 +447,9 @@ impl XboardClient {
         }
 
         let resp = self.client.post(&url).json(&payload).send().await?;
+        if self.v2board_uniproxy {
+            return super::uniproxy::acknowledge(resp).await;
+        }
 
         if !resp.status().is_success() {
             return Err(format!(
@@ -469,12 +477,11 @@ impl XboardClient {
             payload.insert(item.user_id.to_string(), item.ips);
         }
 
-        self.client
-            .post(&url)
-            .json(&payload)
-            .send()
-            .await?
-            .error_for_status()?;
+        let resp = self.client.post(&url).json(&payload).send().await?;
+        if self.v2board_uniproxy {
+            return super::uniproxy::acknowledge(resp).await;
+        }
+        resp.error_for_status()?;
         Ok(())
     }
 
@@ -490,6 +497,9 @@ impl XboardClient {
         }
 
         let val: Value = resp.json().await?;
+        if self.v2board_uniproxy {
+            return Ok(super::uniproxy::alive(&val)?);
+        }
 
         let mut res = HashMap::new();
         let map_obj = val
