@@ -124,7 +124,21 @@ impl RealityServer {
         alpn_protocols: Vec<Vec<u8>>,
     ) -> io::Result<RealityHandshakeResult> {
         let mut header = [0u8; 5];
-        if stream.read_exact(&mut header).await.is_err() || header[0] != 0x16 {
+        // A connect-only health check has no payload to forward. Preserve partial
+        // headers for real non-TLS clients instead of forwarding zero padding.
+        let mut read = 0;
+        while read < header.len() {
+            let n = stream.read(&mut header[read..]).await?;
+            if n == 0 {
+                if read != 0 {
+                    self.fallback(stream, remote_addr, header[..read].to_vec())
+                        .await?;
+                }
+                return Ok(RealityHandshakeResult::Fallbacked);
+            }
+            read += n;
+        }
+        if header[0] != 0x16 {
             debug!(
                 "REALITY: Non-TLS connection from {}, proxying to dest {}",
                 remote_addr, self.config.dest
@@ -559,6 +573,36 @@ mod tests {
 
         let server = RealityServer::new(config);
         assert!(server.is_ok());
+    }
+
+    #[tokio::test]
+    async fn reality_connect_only_probe_does_not_dial_fallback() {
+        let server = RealityServer::new(RealityServerConfig {
+            // Would fail immediately if the empty probe tried fallback.
+            dest: "invalid address".into(),
+            server_names: vec!["example.com".into()],
+            private_key: [7u8; 32],
+            short_ids: vec![],
+            xver: 0,
+            max_time_diff_ms: 60000,
+            min_client_ver: None,
+            max_client_ver: None,
+            spider_x: None,
+        })
+        .unwrap();
+        let (client, inbound) = tokio::io::duplex(64);
+        drop(client);
+        assert!(matches!(
+            server
+                .accept(
+                    Box::new(inbound),
+                    "127.0.0.1:12345".parse().unwrap(),
+                    vec![]
+                )
+                .await
+                .unwrap(),
+            RealityHandshakeResult::Fallbacked
+        ));
     }
 
     #[test]

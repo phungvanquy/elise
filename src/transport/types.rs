@@ -3,6 +3,36 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
 
+// Panel REALITY destinations may omit the HTTPS port.
+fn normalize_reality_dest(dest: &str, default_port: u16) -> Result<String, String> {
+    let dest = dest.trim();
+    if dest.is_empty() {
+        return Err("REALITY security requires non-empty 'dest' setting".into());
+    }
+    if let Ok(ip) = dest.parse::<std::net::IpAddr>() {
+        return Ok(std::net::SocketAddr::new(ip, default_port).to_string());
+    }
+    let invalid =
+        || "REALITY dest must be a hostname or IP with an optional valid port".to_string();
+    if dest
+        .chars()
+        .any(|c| c.is_whitespace() || "/?#@\\".contains(c))
+        || dest.ends_with(':')
+    {
+        return Err(invalid());
+    }
+    let address = url::Url::parse(&format!("tcp://{dest}")).map_err(|_| invalid())?;
+    let host = address
+        .host_str()
+        .filter(|host| !host.is_empty())
+        .ok_or_else(invalid)?;
+    let port = address.port().unwrap_or(default_port);
+    if port == 0 {
+        return Err(invalid());
+    }
+    Ok(format!("{host}:{port}"))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TransportType {
     RawTcp,
@@ -1030,28 +1060,26 @@ impl StreamSettings {
                 let dest = rs_opt
                     .and_then(|rs| rs.get("dest"))
                     .and_then(|v| v.as_str())
-                    .map(String::from)
                     .or_else(|| {
-                        let s_name = rs_opt
+                        rs_opt
                             .and_then(|rs| rs.get("server_name"))
                             .and_then(|v| v.as_str())
-                            .or_else(|| node_info.server_name.as_deref())
-                            .or_else(|| node_info.host.as_deref())?;
-                        let s_port = rs_opt
-                            .and_then(|rs| rs.get("server_port"))
-                            .and_then(|v| {
-                                v.as_u64()
-                                    .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
-                            })
-                            .unwrap_or(443);
-                        Some(format!("{s_name}:{s_port}"))
                     })
+                    .or(node_info.server_name.as_deref())
+                    .or(node_info.host.as_deref())
                     .ok_or_else(|| {
                         "REALITY security requires non-empty 'dest' setting".to_string()
                     })?;
-                if dest.trim().is_empty() {
-                    return Err("REALITY security requires non-empty 'dest' setting".to_string());
-                }
+                let default_port = match rs_opt.and_then(|rs| rs.get("server_port")) {
+                    None | Some(serde_json::Value::Null) => 443,
+                    Some(value) => value
+                        .as_u64()
+                        .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
+                        .and_then(|port| u16::try_from(port).ok())
+                        .filter(|port| *port != 0)
+                        .ok_or("REALITY server_port must be between 1 and 65535")?,
+                };
+                let dest = normalize_reality_dest(dest, default_port)?;
 
                 let priv_key_str = rs_opt
                     .and_then(|rs| rs.get("private_key"))
@@ -1931,6 +1959,56 @@ mod tests {
                 settings.security,
                 TransportSecurityConfig::Reality(_)
             ));
+        }
+    }
+
+    #[test]
+    fn reality_destination_from_panel_defaults_and_validates_port() {
+        use base64::Engine;
+        for (dest, expected) in [
+            (
+                "visualstudio.microsoft.com",
+                "visualstudio.microsoft.com:443",
+            ),
+            ("example.com:8443", "example.com:8443"),
+            ("127.0.0.1", "127.0.0.1:443"),
+            ("::1", "[::1]:443"),
+            ("[::1]", "[::1]:443"),
+            ("[::1]:8443", "[::1]:8443"),
+        ] {
+            let node = NodeInfo {
+                node_type: "vless".into(),
+                tls: Some(2),
+                tls_settings: Some(json!({"dest": dest,
+                    "private_key": base64::engine::general_purpose::STANDARD.encode([1u8; 32])})),
+                ..Default::default()
+            };
+            let settings = StreamSettings::from_node_info(&node).unwrap();
+            let TransportSecurityConfig::Reality(config) = settings.security else {
+                panic!("expected REALITY")
+            };
+            assert_eq!(config.dest, expected);
+        }
+        assert_eq!(
+            normalize_reality_dest("example.com", 8443).unwrap(),
+            "example.com:8443"
+        );
+        assert_eq!(
+            normalize_reality_dest("example.com:443", 8443).unwrap(),
+            "example.com:443"
+        );
+        for dest in [
+            "",
+            "example.com:0",
+            "example.com:65536",
+            "example.com:abc",
+            "example.com:",
+            "https://example.com",
+            "user@example.com",
+            "example.com/path",
+            "bad host",
+        ] {
+            assert!(normalize_reality_dest(dest, 443).is_err(), "{dest}");
         }
     }
 

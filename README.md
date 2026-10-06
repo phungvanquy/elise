@@ -16,7 +16,7 @@ can install it with those package managers. Alpine/OpenRC is not supported by
 these installation tools.
 
 Install the [latest stable release](https://github.com/phungvanquy/elise/releases/latest)
-(current release: **v1.0.6**). Omit the version argument to always install the
+(current release: **v1.0.7**). Omit the version argument to always install the
 latest stable release:
 
 ```bash
@@ -27,8 +27,8 @@ sudo bash /tmp/elise-install.sh install
 For a reproducible version, pin both the bootstrap script and release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/phungvanquy/elise/refs/tags/v1.0.6/install.sh -o /tmp/elise-install.sh &&
-sudo bash /tmp/elise-install.sh install v1.0.6
+curl -fsSL https://raw.githubusercontent.com/phungvanquy/elise/refs/tags/v1.0.7/install.sh -o /tmp/elise-install.sh &&
+sudo bash /tmp/elise-install.sh install v1.0.7
 ```
 
 The installer verifies the release archive's SHA-256 checksum and installs the
@@ -124,7 +124,10 @@ settings. It checks the panel protocol, security mode, and listener port before
 starting the service. Panel selection defaults to `v2board` (unified V2Node); `xiaov2b` and
 `sspanel-uim` are aliases. Protocol aliases are `hysteria1`/`hy1` and `hy2`.
 The panel must expose the requested protocol using its supported Elise adapter.
-REALITY keys must be configured in the panel.
+REALITY keys must be configured in the panel. REALITY destinations accept a hostname
+or IP with an optional port; the default is `tls_settings.server_port` or 443.
+For example, `visualstudio.microsoft.com` uses port 443. Invalid destinations
+are rejected while loading the node configuration.
 
 The managed wizard supports VLESS, VMess, AnyTLS, and Hysteria 1/2. Additional
 native core protocols can be configured manually; their presence in the source
@@ -229,7 +232,7 @@ server-side retention/TTL must be configured on its table separately.
 
 ```bash
 sudo elisectl update          # latest stable Elise release
-sudo elisectl update v1.0.6   # explicit Elise version
+sudo elisectl update v1.0.7   # explicit Elise version
 ```
 
 Updates restart only currently running standalone instances, preserve stopped

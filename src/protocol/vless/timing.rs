@@ -197,7 +197,7 @@ pub fn record_event(tracker: &Option<SharedTimingTracker>, event: VisionTimingEv
         }
     };
 
-    tracing::info!(
+    tracing::debug!(
         target: "elise::vision::timing",
         "[VISION_TIMING] [conn={} flow={}] {}: +{} µs (delta: +{} µs)",
         rec.remote_addr,
