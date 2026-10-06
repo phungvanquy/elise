@@ -42,6 +42,7 @@ pub struct NodeRunner {
     traffic_io_lock: Arc<Mutex<()>>,
     sys_collector: Arc<SystemCollector>,
     synced_user_count: Arc<AtomicU32>,
+    user_sync_state: Mutex<(bool, u32)>,
 }
 
 struct ActiveInbound {
@@ -129,6 +130,7 @@ impl NodeRunner {
             traffic_io_lock: Arc::new(Mutex::new(())),
             sys_collector: Arc::new(SystemCollector::new()),
             synced_user_count: Arc::new(AtomicU32::new(0)),
+            user_sync_state: Mutex::new((false, 0)),
         }
     }
 
@@ -682,14 +684,31 @@ impl NodeRunner {
         mut shutdown: broadcast::Receiver<()>,
         mut certificate_updates: tokio::sync::watch::Receiver<()>,
     ) {
-        let mut users = Vec::new();
-        let mut active = match self.launch_inbound(&info, &users).await {
+        let Some(mut users) = self.initial_users(&mut shutdown).await else {
+            return;
+        };
+        tokio::select! {
+            biased;
+            _ = shutdown.recv() => return,
+            _ = self.sync_alive() => {}
+        }
+        let launched = tokio::select! {
+            biased;
+            _ = shutdown.recv() => return,
+            result = self.launch_inbound(&info, &users) => result,
+        };
+        let mut active = match launched {
             Ok(active) => active,
             Err(e) => {
                 error!(node_id = self.node_id, error = %e, "Inbound startup failed");
                 return;
             }
         };
+        info!(
+            node_id = self.node_id,
+            user_count = users.len(),
+            "Node ready with panel users"
+        );
         let mut retired = tokio::task::JoinSet::new();
         let mut interval = self.panel_interval(false);
         let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
@@ -882,17 +901,46 @@ impl NodeRunner {
         }
     }
 
-    async fn sync_users(&self, inbound: &Arc<dyn Inbound>) -> Option<Vec<User>> {
-        let mut synced = None;
+    async fn initial_users(&self, shutdown: &mut broadcast::Receiver<()>) -> Option<Vec<User>> {
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.recv() => return None,
+                users = self.fetch_users() => {
+                    if users.is_some() { return users; }
+                }
+            }
+            tokio::select! {
+                biased;
+                _ = shutdown.recv() => return None,
+                _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+            }
+        }
+    }
+
+    async fn fetch_users(&self) -> Option<Vec<User>> {
         match self.panel_client.get_users(self.node_id).await {
             Ok(users) => {
-                tracing::debug!(
-                    "Node {}: Synced {} users from panel",
-                    self.node_id,
-                    users.len()
-                );
-                self.synced_user_count
-                    .store(users.len() as u32, Ordering::Relaxed);
+                let mut state = self.user_sync_state.lock();
+                let previous = self
+                    .synced_user_count
+                    .swap(users.len() as u32, Ordering::Relaxed);
+                if !state.0 || state.1 > 0 || previous != users.len() as u32 {
+                    info!(
+                        node_id = self.node_id,
+                        user_count = users.len(),
+                        recovered = state.1 > 0,
+                        "Panel users loaded"
+                    );
+                } else {
+                    tracing::debug!(
+                        node_id = self.node_id,
+                        user_count = users.len(),
+                        "Panel users unchanged in count"
+                    );
+                }
+                *state = (true, 0);
+                drop(state);
                 for u in &users {
                     self.rate_limiter.set_user_limit(u.id, u.speed_limit);
 
@@ -910,14 +958,35 @@ impl NodeRunner {
                             .set_user_limit(u.id, self.global_config.user_tcp_limit);
                     }
                 }
-                inbound.update_users(users.clone());
-                synced = Some(users);
+                Some(users)
             }
             Err(e) => {
-                warn!("Node {}: User sync failed: {:?}", self.node_id, e);
+                let mut state = self.user_sync_state.lock();
+                state.1 = state.1.saturating_add(1);
+                if state.1.is_power_of_two() {
+                    let action = if state.0 {
+                        "retaining previous users"
+                    } else {
+                        "waiting before opening listener"
+                    };
+                    warn!(node_id = self.node_id, failures = state.1, action, error = %e,
+                        "User fetch failed; will retry");
+                }
+                None
             }
         }
+    }
 
+    async fn sync_users(&self, inbound: &Arc<dyn Inbound>) -> Option<Vec<User>> {
+        let users = self.fetch_users().await;
+        if let Some(users) = &users {
+            inbound.update_users(users.clone());
+        }
+        self.sync_alive().await;
+        users
+    }
+
+    async fn sync_alive(&self) {
         match self.panel_client.get_user_alivelist(self.node_id).await {
             Ok(alive_map) => {
                 self.device_limiter.update_global_alive(alive_map);
@@ -927,7 +996,6 @@ impl NodeRunner {
                     .is_some_and(|io| io.kind() == std::io::ErrorKind::Unsupported) => {}
             Err(e) => warn!(node_id = self.node_id, error = %e, "Alive list sync failed"),
         }
-        synced
     }
 
     async fn report_data(&self, force: bool) {
@@ -1097,6 +1165,189 @@ mod tests {
             )),
             Arc::new(IpUserCache::new(1, false, "")),
         )
+    }
+
+    struct UserPanel {
+        replies: Mutex<std::collections::VecDeque<Option<Vec<User>>>>,
+        calls: AtomicU32,
+    }
+
+    impl UserPanel {
+        fn new(replies: Vec<Option<Vec<User>>>) -> Arc<Self> {
+            Arc::new(Self {
+                replies: Mutex::new(replies.into()),
+                calls: AtomicU32::new(0),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PanelClient for UserPanel {
+        async fn get_node_info(
+            &self,
+            _: u32,
+        ) -> Result<NodeInfo, Box<dyn std::error::Error + Send + Sync>> {
+            Err("panel unavailable".into())
+        }
+        async fn get_users(
+            &self,
+            _: u32,
+        ) -> Result<Vec<User>, Box<dyn std::error::Error + Send + Sync>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.replies
+                .lock()
+                .pop_front()
+                .flatten()
+                .ok_or_else(|| "panel unavailable".into())
+        }
+        async fn report_traffic(
+            &self,
+            _: u32,
+            _: Vec<TrafficItem>,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        async fn report_online_devices(
+            &self,
+            _: u32,
+            _: Vec<OnlineDeviceItem>,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initial_users_retry_and_empty_success_and_shutdown() {
+        let panel = UserPanel::new(vec![None, Some(vec![])]);
+        let mut runner = runner("http://unused".into());
+        runner.panel_client = panel.clone();
+        let (shutdown, mut rx) = broadcast::channel(1);
+        let start = tokio::time::Instant::now();
+        assert!(runner.initial_users(&mut rx).await.unwrap().is_empty());
+        assert_eq!(panel.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(start.elapsed(), Duration::from_secs(10));
+        // A shutdown during the retry delay must not wait for the next poll.
+        let wait = runner.initial_users(&mut rx);
+        tokio::pin!(wait);
+        tokio::select! {
+            _ = &mut wait => panic!("outage should retry"),
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+        shutdown.send(()).unwrap();
+        assert!(wait.await.is_none());
+        assert_eq!(panel.calls.load(Ordering::Relaxed), 3);
+    }
+
+    async fn socks_auth(port: u16) -> u8 {
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        stream.write_all(b"\x05\x01\x02").await.unwrap();
+        let mut response = [0; 2];
+        stream.read_exact(&mut response).await.unwrap();
+        if response[1] == 255 {
+            return 255;
+        }
+        stream.write_all(b"\x01\x04test\x04pass").await.unwrap();
+        stream.read_exact(&mut response).await.unwrap();
+        response[1]
+    }
+
+    #[tokio::test]
+    async fn startup_authenticates_before_poll_and_reload_retains_users() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let user = User {
+                id: 42,
+                uuid: "test".into(),
+                password: Some("pass".into()),
+                ..Default::default()
+            };
+            let panel = UserPanel::new(vec![Some(vec![user]), None, Some(vec![])]);
+            let mut runner = runner("http://unused".into());
+            runner.panel_client = panel.clone();
+            let dir = std::env::temp_dir().join(format!("elise-users-{}", uuid::Uuid::new_v4()));
+            Arc::get_mut(&mut runner.global_config).unwrap().nodes_dir = Some(dir.clone());
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            let info = NodeInfo {
+                node_type: "socks".into(),
+                server_port: port,
+                listen_ip: Some("127.0.0.1".into()),
+                ..Default::default()
+            };
+            let runner = Arc::new(runner);
+            let (shutdown, rx) = broadcast::channel(1);
+            let (updates, certificate_rx) = tokio::sync::watch::channel(());
+            let task = tokio::spawn(runner.clone().run_inbound(info, rx, certificate_rx));
+            loop {
+                if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                    .await
+                    .is_ok()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(socks_auth(port).await, 0);
+            assert_eq!(
+                panel.calls.load(Ordering::Relaxed),
+                1,
+                "no duplicate startup fetch"
+            );
+            // Force a listener replacement while the panel is unavailable.
+            updates.send(()).unwrap();
+            while !dir.join("node_1.conf").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(socks_auth(port).await, 0);
+            assert_eq!(
+                panel.calls.load(Ordering::Relaxed),
+                1,
+                "certificate reload must reuse users"
+            );
+            shutdown.send(()).unwrap();
+            task.await.unwrap();
+            let _ = std::fs::remove_dir_all(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_user_sync_keeps_access_and_empty_success_revokes_it() {
+        let user = User {
+            id: 42,
+            uuid: "test".into(),
+            password: Some("pass".into()),
+            ..Default::default()
+        };
+        let panel = UserPanel::new(vec![Some(vec![user]), None, Some(vec![])]);
+        let mut runner = runner("http://unused".into());
+        runner.panel_client = panel;
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let info = NodeInfo {
+            node_type: "socks".into(),
+            server_port: port,
+            listen_ip: Some("127.0.0.1".into()),
+            ..Default::default()
+        };
+        let mut active = runner.launch_inbound(&info, &[]).await.unwrap();
+        assert_eq!(runner.sync_users(&active.inbound).await.unwrap().len(), 1);
+        assert_eq!(socks_auth(port).await, 0);
+        assert!(runner.sync_users(&active.inbound).await.is_none());
+        assert_eq!(socks_auth(port).await, 0);
+        assert_eq!(runner.synced_user_count.load(Ordering::Relaxed), 1);
+        assert!(runner.sync_users(&active.inbound).await.unwrap().is_empty());
+        assert_eq!(socks_auth(port).await, 255);
+        assert_eq!(runner.synced_user_count.load(Ordering::Relaxed), 0);
+        active.stop().await;
     }
 
     #[test]
@@ -1454,6 +1705,7 @@ mod tests {
                     .port()
             };
             let mut runner = runner("http://127.0.0.1:1".into());
+            runner.panel_client = UserPanel::new(vec![Some(vec![])]);
             Arc::get_mut(&mut runner.global_config).unwrap().nodes_dir = Some(dir.join("nodes"));
             *runner.node_config.write() = NodeConfig {
                 cert_file: Some(cert_path.clone()),

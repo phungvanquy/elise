@@ -16,7 +16,7 @@ can install it with those package managers. Alpine/OpenRC is not supported by
 these installation tools.
 
 Install the [latest stable release](https://github.com/phungvanquy/elise/releases/latest)
-(current release: **v1.0.7**). Omit the version argument to always install the
+(current release: **v1.0.8**). Omit the version argument to always install the
 latest stable release:
 
 ```bash
@@ -27,8 +27,8 @@ sudo bash /tmp/elise-install.sh install
 For a reproducible version, pin both the bootstrap script and release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/phungvanquy/elise/refs/tags/v1.0.7/install.sh -o /tmp/elise-install.sh &&
-sudo bash /tmp/elise-install.sh install v1.0.7
+curl -fsSL https://raw.githubusercontent.com/phungvanquy/elise/refs/tags/v1.0.8/install.sh -o /tmp/elise-install.sh &&
+sudo bash /tmp/elise-install.sh install v1.0.8
 ```
 
 The installer verifies the release archive's SHA-256 checksum and installs the
@@ -196,6 +196,16 @@ Use `elisectl log <instance>` to follow a node's systemd journal. The default
 connections, successful user polls, and handshake details use `debug`. To investigate
 an issue, temporarily set `log_level=debug` in the instance's `elise.conf` and restart
 it; return to `info` afterwards. `RUST_LOG` overrides this setting when present.
+Every protocol fetches its initial panel user list before opening its listener.
+Failed initial user requests retry every 10 seconds and can be interrupted by shutdown.
+A successful empty list is valid and starts the listener with no authorized users.
+`Panel users loaded` and `Node ready with panel users` show the initial counts at info
+level. Later polling uses the configured/panel pull interval; failed refreshes retain
+the last valid users, while a successful empty response revokes access. Listener and
+certificate reloads reuse the last valid list. User-count changes and recovery are
+logged at info; unchanged counts use debug. Repeated user-fetch failures are summarized
+at failure counts 1, 2, 4, 8, and so on, keeping persistent outages quiet.
+
 Runtime logs redact panel tokens, ClickHouse passwords, and URL credentials/queries.
 VMess credentials and VLESS/REALITY private-key configurations are never logged.
 
@@ -232,7 +242,7 @@ server-side retention/TTL must be configured on its table separately.
 
 ```bash
 sudo elisectl update          # latest stable Elise release
-sudo elisectl update v1.0.7   # explicit Elise version
+sudo elisectl update v1.0.8   # explicit Elise version
 ```
 
 Updates restart only currently running standalone instances, preserve stopped

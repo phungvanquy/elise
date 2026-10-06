@@ -162,7 +162,7 @@ impl MasterServer {
         }
 
         info!(
-            "All {} node runner(s) started successfully",
+            "Spawned {} node runner(s); waiting for node readiness",
             node_handles.len()
         );
 
@@ -275,6 +275,26 @@ mod tests {
                     )
                     .await
                     .unwrap();
+                if case == "bind_error" {
+                    loop {
+                        let (mut stream, _) = panel.accept().await.unwrap();
+                        let mut request = Vec::new();
+                        while !request.ends_with(b"\r\n\r\n") {
+                            request.push(stream.read_u8().await.unwrap());
+                        }
+                        let is_users =
+                            String::from_utf8_lossy(&request).contains("/UniProxy/user?");
+                        let body = if is_users {
+                            r#"{"users":[]}"#
+                        } else {
+                            r#"{"data":true}"#
+                        };
+                        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                        if is_users {
+                            break;
+                        }
+                    }
+                }
             });
 
             let dir =
