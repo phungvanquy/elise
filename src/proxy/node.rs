@@ -1083,7 +1083,7 @@ impl NodeRunner {
             (res, active)
         };
 
-        if !items.is_empty() || self.panel_client.traffic_heartbeat() {
+        if !items.is_empty() || (!force && self.panel_client.traffic_heartbeat()) {
             if let Err(e) = self.save_pending().await {
                 error!(node_id = self.node_id, error = %e, "Traffic batch not persisted; report deferred");
                 return;
@@ -1288,6 +1288,19 @@ mod tests {
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_flushes_pending_traffic_without_idle_heartbeat() {
+        let panel = UserPanel::new(vec![]);
+        let mut runner = runner("http://unused".into());
+        runner.panel_client = panel.clone();
+        runner.report_data(true).await;
+        assert_eq!(panel.reports.load(Ordering::Relaxed), 0);
+        runner.traffic_buffer.lock().insert(7, (10, 20));
+        runner.report_data(true).await;
+        assert_eq!(panel.reports.load(Ordering::Relaxed), 1);
+        assert!(runner.traffic_buffer.lock().is_empty());
     }
 
     #[tokio::test(start_paused = true)]
