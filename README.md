@@ -411,7 +411,26 @@ remain available for recovery; `elisectl install` reinstalls the core.
 `elisectl remove <instance>` deletes its configuration and certificates after
 stopping it. External certificates and retained state are not deleted.
 
-To permanently remove **all standalone Elise instances and their retained data**:
+### Completely uninstall Elise
+
+To permanently remove **all standalone Elise instances and their retained data**,
+download and run `uninstall.sh`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/phungvanquy/elise/refs/heads/main/uninstall.sh -o /tmp/elise-uninstall.sh &&
+sudo bash /tmp/elise-uninstall.sh --yes
+```
+
+From a checkout of this repository, run `sudo bash uninstall.sh --yes`.
+Use `bash uninstall.sh --help` to see what it removes.
+
+The script downloads the current purge tool over HTTPS. It requires Linux with
+systemd, root, Bash, curl, CA certificates, and flock (util-linux). It works with
+older installations, including v1.0.8, and after the manager has been removed.
+No binary rebuild, upgrade, or new release is needed.
+
+If your installed manager already supports `purge`, you can also remove Elise
+directly without downloading anything:
 
 ```bash
 sudo elisectl purge --yes
@@ -427,15 +446,6 @@ drop-ins and enablement links. If a service cannot be stopped, no files are dele
 External certificate/log/state paths, original V2bX directories, and the host's system
 journal are preserved. Symlinks inside Elise's directories are removed without deleting
 their external targets.
-
-If your installed manager does not yet include `purge` (including v1.0.8), use the
-current management script directly. **No binary rebuild, upgrade, or new release is needed:**
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/phungvanquy/elise/refs/heads/main/scripts/elise.sh -o /tmp/elise-manager.sh &&
-sudo bash /tmp/elise-manager.sh purge --yes
-```
-
 
 ## Build and test
 

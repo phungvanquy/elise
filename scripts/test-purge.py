@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Test purge in a temporary filesystem with a fake systemctl; never touch host services."""
 from pathlib import Path
+import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -132,6 +134,103 @@ class PurgeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.root / 'state').is_symlink())
         self.assertTrue((self.root / 'outside/key.pem').exists())
+
+
+class UninstallBootstrapTests(unittest.TestCase):
+    """Exercise the entry point with offline downloads and a harmless manager."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.bootstrap = HELPER.resolve().parent.parent / 'uninstall.sh'
+        self.manager = self.root / 'manager'
+        self.manager.write_text('''#!/bin/bash
+printf '%s\\n' "$@" > "$FIXTURE/manager-args"
+exit "${PURGE_STATUS:-0}"
+''')
+        curl = self.root / 'curl'
+        curl.write_text('''#!/usr/bin/env python3
+import json, os, pathlib, shutil, sys
+root = pathlib.Path(os.environ['FIXTURE'])
+args = sys.argv[1:]
+(root / 'curl-args').write_text(json.dumps(args))
+if os.environ.get('DOWNLOAD_FAIL'):
+    sys.exit(22)
+shutil.copyfile(root / 'manager', args[args.index('--output') + 1])
+''')
+        curl.chmod(0o755)
+
+    def run_uninstall(self, *arguments, **extra_env):
+        # Override only host prerequisites. Real downloads are replaced via PATH;
+        # the manager fixture never executes any host filesystem/service operation.
+        setup = '''
+source "$1"; shift
+ensure_uninstall_dependencies() { echo checked > "$FIXTURE/dependencies"; }
+main "$@"
+'''
+        return subprocess.run(['bash', '-c', setup, 'bash', str(self.bootstrap), *arguments],
+                              env=dict(os.environ, PATH=f'{self.root}:{os.environ["PATH"]}',
+                                       FIXTURE=str(self.root), **extra_env),
+                              input='', capture_output=True, text=True, timeout=10)
+
+    def assert_download_cleaned_up(self):
+        args = json.loads((self.root / 'curl-args').read_text())
+        download = Path(args[args.index('--output') + 1])
+        self.assertFalse(download.parent.exists(), download.parent)
+        return args
+
+    def test_confirmation_and_help_never_download_or_run_manager(self):
+        for arguments in [(), ('--force',), ('--yes', 'extra'), ('--help', '--yes'),
+                          ('--help',), ('-h',), ('help',)]:
+            with self.subTest(arguments=arguments):
+                result = self.run_uninstall(*arguments)
+                if arguments in [('--help',), ('-h',), ('help',)]:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn('Permanently remove', result.stdout)
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('--yes', result.stderr)
+                for name in ['dependencies', 'curl-args', 'manager-args']:
+                    self.assertFalse((self.root / name).exists(), name)
+
+    def test_downloads_current_manager_and_runs_purge_with_confirmation(self):
+        result = self.run_uninstall('--yes')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.root / 'manager-args').read_text().splitlines(), ['purge', '--yes'])
+        args = self.assert_download_cleaned_up()
+        self.assertEqual(args[-1], 'https://raw.githubusercontent.com/phungvanquy/elise/refs/heads/main/scripts/elise.sh')
+        for flag in ['--proto', '--proto-redir']:
+            self.assertEqual(args[args.index(flag) + 1], '=https')
+
+    def test_failed_download_does_not_run_manager(self):
+        result = self.run_uninstall('--yes', DOWNLOAD_FAIL='1')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('could not download', result.stderr)
+        self.assertFalse((self.root / 'manager-args').exists())
+        self.assert_download_cleaned_up()
+
+    def test_empty_or_invalid_download_does_not_run_manager(self):
+        for content in ['', 'if then\n']:
+            with self.subTest(content=content):
+                self.manager.write_text(content)
+                result = self.run_uninstall('--yes')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('invalid removal tool', result.stderr)
+                self.assertFalse((self.root / 'manager-args').exists())
+                self.assert_download_cleaned_up()
+
+    def test_purge_failure_is_propagated_and_download_is_cleaned_up(self):
+        result = self.run_uninstall('--yes', PURGE_STATUS='23')
+        self.assertEqual(result.returncode, 23, result.stderr)
+        self.assert_download_cleaned_up()
+
+    def test_help_works_from_file_and_stdin(self):
+        for command, source in [(['bash', str(self.bootstrap), '--help'], ''),
+                                (['bash', '-s', '--', '--help'], self.bootstrap.read_text())]:
+            result = subprocess.run(command, input=source, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('uninstall.sh --yes', result.stdout)
 
 
 if __name__ == '__main__':

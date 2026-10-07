@@ -41,7 +41,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Bash syntax and ShellCheck
         run: |
-          for script in install.sh scripts/*.sh; do bash -n "$script"; done
-          shellcheck --severity=error install.sh scripts/*.sh
+          for script in install.sh uninstall.sh scripts/*.sh; do bash -n "$script"; done
+          shellcheck --severity=error install.sh uninstall.sh scripts/*.sh
       - run: bash scripts/test-elise.sh
       - run: python3 scripts/test-deploy.py
