@@ -11,6 +11,7 @@ from threading import Thread
 import json
 import os
 import socket
+import ssl
 import subprocess
 import sys
 import tarfile
@@ -90,6 +91,12 @@ try:
                 f'type=xboard\npanel_url=http://127.0.0.1:{server.server_port}\n'
                 f'panel_key=key+value\npanel_node_type={kind}\nnode_id=9\nlisten=127.0.0.1\n'
             )
+
+        def assert_self_signed_validity(cert_path):
+            decoded = ssl._ssl._test_decode_cert(str(cert_path))
+            lifetime = ssl.cert_time_to_seconds(decoded['notAfter']) - ssl.cert_time_to_seconds(decoded['notBefore'])
+            assert lifetime == 3650 * 24 * 60 * 60, decoded
+            assert ('DNS', 'node.example.com') in decoded['subjectAltName']
 
         for kind, payload, security, transport in [
             ('vless', {'tls': 1}, 1, 'tcp'),
@@ -304,10 +311,9 @@ print(os.environ['ELISE_TEST_NODE_INFO'])
                 else:
                     assert 'cert_mode=file\n' in contents and 'Trust this certificate' in result.stdout
                     assert key_path.stat().st_mode & 0o777 == 0o600
-                    import ssl
                     ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(cert_path, key_path)
-                    decoded = ssl._ssl._test_decode_cert(str(cert_path))
-                    assert ('DNS', 'node.example.com') in decoded['subjectAltName']
+                    assert_self_signed_validity(cert_path)
+                    assert 'valid for 3650 days' in result.stdout
                     before = cert_path.read_bytes()
                     run_helper(service_setup + 'service_action restart "$1"', config_root, instance, check=True)
                     assert cert_path.read_bytes() == before
@@ -376,6 +382,8 @@ print(os.environ['ELISE_TEST_NODE_INFO'])
                 assert 'cert_mode=http\n' in contents and 'acme_email=admin@example.com\n' in contents
             if kind == 'hysteria':
                 assert (config.parent / 'cert/privkey.pem').stat().st_mode & 0o777 == 0o600
+                assert_self_signed_validity(config.parent / 'cert/fullchain.pem')
+                assert 'valid for 3650 days' in result.stdout
             before_services = service_log.read_bytes()
             again = run_helper(setup + 'add_node "$@"', config_root, *options, input='')
             assert again.returncode != 0 and 'already exists' in again.stderr

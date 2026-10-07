@@ -353,7 +353,7 @@ configure_tls() {
 TLS certificate:
   1) Existing certificate and private key files (default)
   2) Automatic Let's Encrypt certificate (HTTP-01, with automatic renewal)
-  3) Generate a self-signed certificate (clients must trust it explicitly)
+  3) Generate a self-signed certificate (3650 days; clients must trust it explicitly)
 EOF
         read -rp 'Certificate mode [1]: ' mode
         mode=${mode:-1}
@@ -392,7 +392,7 @@ PY
             else
                 ensure_openssl
                 mkdir -m 0700 "$work/cert"
-                (umask 077; openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 365 \
+                (umask 077; openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 3650 \
                     -subj "/CN=$domain" -addext "subjectAltName=DNS:$domain" \
                     -addext 'basicConstraints=critical,CA:FALSE' -addext 'keyUsage=critical,digitalSignature,keyEncipherment' \
                     -addext 'extendedKeyUsage=serverAuth' \
@@ -568,7 +568,7 @@ EOF
         1) echo "Configure your certificate renewal tool to run: elisectl restart $instance" ;;
         2) echo "Elise renews this certificate automatically and reloads the listener after renewal." ;;
         3)
-            echo "Self-signed certificate saved at $target/cert/fullchain.pem (valid for 365 days)."
+            echo "Self-signed certificate saved at $target/cert/fullchain.pem (valid for 3650 days, about 10 years)."
             echo "Trust this certificate explicitly in your client and set the TLS server name to the configured hostname. Replace it before expiry."
             openssl x509 -in "$target/cert/fullchain.pem" -noout -fingerprint -sha256
             ;;
@@ -696,7 +696,7 @@ Node options (using any option disables all prompts):
   --api-key-file=PATH            Read the key from a file instead of --api-key
   --cert-mode=file              Requires --cert-file=PATH and --key-file=PATH
   --cert-mode=http              Requires --domain=HOST and --email=ADDRESS
-  --cert-mode=self-signed       Requires --domain=HOST; clients must trust the certificate
+  --cert-mode=self-signed       Valid for 3650 days; requires --domain=HOST and client trust
 TLS options are required only for certificate TLS, as configured in the panel.
 HTTP mode uses Let's Encrypt HTTP-01; DNS must point here and TCP port 80 must be open.
 Options accept --name=value or --name value. Existing instances are never overwritten.

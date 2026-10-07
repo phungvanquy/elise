@@ -287,11 +287,15 @@ lines with the matching set:
 | --- | --- | --- |
 | Existing files | `--cert-mode=file --cert-file=/etc/ssl/elise/fullchain.pem --key-file=/etc/ssl/elise/privkey.pem` | External tool; restart the instance from its deploy hook |
 | Automatic Let's Encrypt | `--cert-mode=http --domain=node.example.com --email=admin@example.com` | Elise renews and reloads the listener |
-| Self-signed certificate | `--cert-mode=self-signed --domain=node.example.com` | Replace before its 365-day expiry; explicitly trust it in clients |
+| Self-signed certificate | `--cert-mode=self-signed --domain=node.example.com` | Valid for 3650 days (about 10 years); replace before expiry and explicitly trust it in clients |
 
 The interactive wizard asks for the same information. Existing-file mode
 requires absolute paths to a PEM certificate chain and matching unencrypted
 private key.
+
+The self-signed validity applies to newly generated certificates. Existing
+certificates keep their original expiry date; updating Elise or restarting a
+node does not extend it. Self-signed certificates are not renewed automatically.
 
 HTTP-01 requires DNS to point at this server and public inbound TCP port 80 to
 remain available. Proxy TCP listeners must use another port. The wizard checks

@@ -79,6 +79,7 @@ For certificate TLS, choose one:
   --cert-mode=file --cert-file=/absolute/fullchain.pem --key-file=/absolute/key.pem
   --cert-mode=http --domain=node.example.com --email=admin@example.com
   --cert-mode=self-signed --domain=node.example.com
+Self-signed certificates are valid for 3650 days (about 10 years); clients must trust them.
 HTTP mode uses Let's Encrypt HTTP-01; DNS must point here and TCP port 80 must be open.
 Options accept --name=value or --name value. Existing nodes are never overwritten.
 Node options require Elise v1.0.5 or newer. Pin a release with the positional version.
