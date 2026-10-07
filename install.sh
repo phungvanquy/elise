@@ -47,6 +47,7 @@ PY
     actual=$(sha256sum "$work/$asset" | awk '{print $1}')
     [[ "${expected,,}" == "$actual" ]] || die 'Checksum mismatch; installation unchanged'
     # Extract only regular, explicitly named files; never follow archive links.
+    # migrate.py is an inert compatibility stub in newer releases.
     python3 - "$work/$asset" "$work" <<'PY'
 import pathlib, sys, tarfile
 names = ('elise', 'elisectl', 'install.sh', 'install-release.py', 'migrate.py', 'runtime.py',

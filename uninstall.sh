@@ -17,7 +17,7 @@ Permanently remove all standalone Elise instances and their retained data:
   - Delete /etc/elise and /var/lib/elise, including certificates and backups.
   - Remove the Elise binaries, management tools, and installed licenses.
 
-External certificate/log/state files, legacy V2bX data, and the system journal
+External certificate/log/state files and the system journal
 are preserved. --yes is required; this cannot be undone.
 
 Requires Linux with systemd, root, Bash, curl, CA certificates, and flock.

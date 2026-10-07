@@ -50,7 +50,7 @@ struct Hy2Bandwidth {
 impl Hy2Bandwidth {
     fn from_node(node: &NodeInfo) -> Self {
         Self {
-            // Panel directions match V2bX: up is server TX, down is server RX.
+            // Panel directions are from the server: up is TX, down is RX.
             max_tx: u64::from(node.up_mbps.unwrap_or(0)) * 125_000,
             max_rx: u64::from(node.down_mbps.unwrap_or(0)) * 125_000,
             ignore_client: node.ignore_client_bandwidth,
@@ -373,7 +373,7 @@ async fn handle_hy2_connection(
 ) -> io::Result<()> {
     let auth = Arc::new(Hy2AuthState::default());
     let mut transport = hysteria_transport_config(true);
-    // V2bX's Go client deliberately omits this parameter in Chrome mode.
+    // Some Go clients omit this parameter in Chrome-style handshakes.
     // Hysteria negotiates UDP at /auth and fixes its frame limit at 1200 bytes.
     transport.assume_peer_max_datagram_frame_size(Some(1200u32.into()));
     transport.congestion_controller_factory(Arc::new(Hy2CongestionFactory {
@@ -787,7 +787,7 @@ async fn handle_hy2_tcp_stream(
     let early_response = ctx.global_config.domain_sniff && target_ip.is_some();
     if early_response {
         // Non-fast-open clients wait for TCPResponse before sending the bytes
-        // needed by the sniffer. V2bX's RequestHook accepts first for this reason.
+        // needed by the sniffer, so accept the stream before sniffing.
         stream.write_all(&[0, 0, 0]).await?;
     }
     let (sniffed, stream) =
@@ -1019,7 +1019,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bandwidth_negotiation_matches_v2bx_units_and_unlimited_semantics() {
+    fn bandwidth_negotiation_converts_mbps_and_preserves_unlimited_rates() {
         let mut node = NodeInfo {
             up_mbps: Some(80),
             down_mbps: Some(16),

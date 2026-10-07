@@ -8,62 +8,45 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import tarfile
 import unittest
 
-import migrate
 from runtime import Paths
 
 spec = importlib.util.spec_from_file_location('install_release', Path(__file__).with_name('install-release.py'))
 installer = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(installer)
 
+# Archive contract enforced by already released Elise installers. Keep this
+# independent of release_files() so packaging cannot silently break upgrades.
+REQUIRED_ARCHIVE_FILES = (
+    'elise', 'elisectl', 'install.sh', 'install-release.py', 'migrate.py',
+    'runtime.py', 'elise@.service', 'LICENSE', 'SCRIPTS-LICENSE', 'THIRD-PARTY-NOTICES',
+)
+
 
 class FakeSystemd:
-    def __init__(self, paths):
-        self.paths = paths
+    def __init__(self):
         self.units = {}
         self.calls = []
-        self.on_stop = None
-
-    def add(self, instance, active=True, enabled='enabled', dropins=()):
-        unit = f'V2bX-elise@{instance}.service'
-        self.units[unit] = {'active': active, 'enabled': enabled, 'dropins': list(dropins)}
 
     def entry(self, unit):
-        return self.units.setdefault(unit, {'active': False, 'enabled': 'disabled', 'dropins': []})
+        return self.units.setdefault(unit, {'active': False, 'enabled': 'disabled'})
 
     def active(self, unit):
         return self.entry(unit)['active']
-
-    def enabled(self, unit):
-        return self.entry(unit)['enabled']
-
-    def property(self, unit, prop):
-        if prop == 'FragmentPath':
-            return str(self.paths.units / 'V2bX-elise@.service')
-        if prop == 'DropInPaths':
-            return ' '.join(str(p) for p in self.entry(unit)['dropins'])
-        raise AssertionError(prop)
 
     def run(self, command, *arguments):
         self.calls.append((command, *arguments))
         if command == 'daemon-reload':
             return ''
-        unit = arguments[-1]
-        entry = self.entry(unit)
+        entry = self.entry(arguments[-1])
         if command in ('start', 'stop'):
             if command == 'start':
                 assert entry['enabled'] != 'masked'
-                if unit.startswith('elise@'):
-                    assert not self.active('V2bX-' + unit)
             entry['active'] = command == 'start'
-            if command == 'stop' and self.on_stop:
-                self.on_stop(unit)
-        elif command in ('enable', 'disable', 'mask', 'unmask'):
-            entry['enabled'] = {'enable': 'enabled', 'disable': 'disabled',
-                                'mask': 'masked', 'unmask': 'disabled'}[command]
         else:
             raise AssertionError(command)
         return ''
@@ -74,147 +57,11 @@ class DeploymentTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.paths = Paths(Path(self.temp.name))
-        self.systemd = FakeSystemd(self.paths)
+        self.systemd = FakeSystemd()
         self.paths.units.mkdir(parents=True)
         self.paths.binary.parent.mkdir(parents=True)
         self.paths.binary.write_text('old binary')
         self.paths.unit.write_text('standalone template')
-        self.paths.legacy_helper.parent.mkdir(parents=True)
-        self.paths.legacy_helper.write_text('old helper')
-        (self.paths.units / 'V2bX-elise@.service').write_text(
-            '[Service]\nUser=root\nGroup=root\n'
-            f'WorkingDirectory={self.paths.legacy_config}/%i\n'
-            f'ExecStart={self.paths.legacy_binary} run -c {self.paths.legacy_config}/%i/elise.conf\n'
-            'Restart=on-failure\n[Install]\nWantedBy=multi-user.target\n'
-        )
-
-    def legacy(self, instance='vmess-9', active=True, enabled='enabled', extra=''):
-        source = self.paths.legacy_config / instance
-        source.mkdir(parents=True)
-        (source / 'nodes').mkdir()
-        (source / 'cert').mkdir()
-        (source / 'cert/key.pem').write_text('keep this private key')
-        (source / 'traffic').mkdir()
-        (source / 'traffic/pending.json').write_text('{"7":[1,2]}')
-        (source / 'elise.conf').write_text(
-            f'type=xboard\nnode_id=9\npanel_node_type=vmess\nlisten=127.0.0.1\n'
-            f'panel_key=literal {source}/must-not-change\n'
-            f'nodes_dir={source}/nodes\ncert_file={source}/cert/cert.pem\n'
-            f'key_file={source}/cert/key.pem\n{extra}'
-        )
-        (source / 'nodes/node_9.conf').write_text(f'[user]\nkey_file={source}/cert/key.pem\n')
-        self.systemd.add(instance, active, enabled)
-        return source
-
-    def run_migration(self, **kwargs):
-        return migrate.migrate(self.paths, self.systemd, health=lambda _paths, _instance: None, **kwargs)
-
-    def test_dry_run_is_read_only(self):
-        self.legacy()
-        self.run_migration(dry_run=True)
-        self.assertEqual(self.systemd.calls, [])
-        self.assertFalse(self.paths.config.exists())
-        self.assertFalse(self.paths.backups.exists())
-        self.assertEqual(self.paths.legacy_helper.read_text(), 'old helper')
-
-    def test_migration_preserves_states_keys_credentials_and_effective_state_path(self):
-        source = self.legacy(extra='[node_9]\nlisten=127.0.0.1\n')
-        self.legacy('anytls-10', active=False, enabled='enabled')
-        self.legacy('hysteria2-11', active=True, enabled='disabled')
-        self.legacy('vless-12', active=False, enabled='disabled')
-        self.run_migration()
-        target = self.paths.config / 'vmess-9'
-        values = migrate.global_values((target / 'elise.conf').read_text())
-        self.assertEqual(values['ip_user_cache_save_dir'], str(source))
-        self.assertEqual(values['key_file'], str(target / 'cert/key.pem'))
-        self.assertEqual(values['panel_key'], f'literal {source}/must-not-change')
-        self.assertEqual((target / 'cert/key.pem').read_bytes(), (source / 'cert/key.pem').read_bytes())
-        self.assertIn(str(target / 'cert/key.pem'), (target / 'nodes/node_9.conf').read_text())
-        self.assertTrue(self.systemd.active('elise@vmess-9.service'))
-        self.assertFalse(self.systemd.active('elise@anytls-10.service'))
-        self.assertEqual(self.systemd.enabled('elise@anytls-10.service'), 'enabled')
-        self.assertTrue(self.systemd.active('elise@hysteria2-11.service'))
-        self.assertEqual(self.systemd.enabled('elise@hysteria2-11.service'), 'disabled')
-        self.assertFalse(self.systemd.active('elise@vless-12.service'))
-        self.assertEqual(self.systemd.enabled('elise@vless-12.service'), 'disabled')
-        self.assertEqual(self.systemd.enabled('V2bX-elise@vmess-9.service'), 'masked')
-        self.assertEqual((target / 'elise.conf').stat().st_mode & 0o777, 0o600)
-        self.assertEqual(subprocess.run(['bash', str(self.paths.legacy_helper), 'uninstall'], capture_output=True).returncode, 0)
-        before = list(self.systemd.calls)
-        self.run_migration()
-        self.assertEqual(self.systemd.calls, before)
-
-    def test_explicit_relative_state_is_resolved_against_old_working_directory(self):
-        source = self.legacy(extra='ip_user_cache_save_dir=state\n')
-        self.run_migration()
-        config = (self.paths.config / 'vmess-9/elise.conf').read_text()
-        self.assertEqual(migrate.global_values(config)['ip_user_cache_save_dir'], str(source / 'state'))
-
-    def test_rollback_keeps_latest_traffic_and_restores_all_legacy_states(self):
-        source = self.legacy()
-        self.legacy('anytls-10', active=False, enabled='disabled')
-        pending = source / 'traffic/pending.json'
-        def failed_health(_paths, _instance):
-            # The new service acknowledged some traffic. Restoring the old
-            # snapshot would report it twice, so rollback MUST retain this file.
-            pending.write_text('{"7":[0,1]}')
-            raise RuntimeError('simulated listener failure')
-        with self.assertRaisesRegex(RuntimeError, 'listener failure'):
-            migrate.migrate(self.paths, self.systemd, health=failed_health)
-        self.assertEqual(pending.read_text(), '{"7":[0,1]}')
-        self.assertTrue(self.systemd.active('V2bX-elise@vmess-9.service'))
-        self.assertEqual(self.systemd.enabled('V2bX-elise@vmess-9.service'), 'enabled')
-        self.assertFalse(self.systemd.active('V2bX-elise@anytls-10.service'))
-        self.assertFalse((self.paths.config / 'vmess-9').exists())
-        self.assertEqual(self.paths.legacy_helper.read_text(), 'old helper')
-        self.assertFalse((self.paths.units / 'elise@vmess-9.service').exists())
-        self.assertEqual(self.systemd.enabled('elise@vmess-9.service'), 'disabled')
-
-    def test_existing_destination_is_never_overwritten(self):
-        self.legacy()
-        target = self.paths.config / 'vmess-9'
-        target.mkdir(parents=True)
-        (target / 'elise.conf').write_text('independent config')
-        with self.assertRaisesRegex(RuntimeError, 'refusing to overwrite'):
-            self.run_migration()
-        self.assertEqual(self.systemd.calls, [])
-        self.assertEqual((target / 'elise.conf').read_text(), 'independent config')
-
-    def test_v2bx_owned_certificates_are_flagged_before_stopping_services(self):
-        self.legacy(extra=f'key_file={self.paths.at("/etc/V2bX/cert/key.pem")}\n')
-        with self.assertRaisesRegex(RuntimeError, 'V2bX-owned data'):
-            self.run_migration()
-        self.assertEqual(self.systemd.calls, [])
-
-    def test_dropin_resource_limits_are_preserved(self):
-        self.legacy()
-        dropin = self.paths.units / 'V2bX-elise@.service.d/limits.conf'
-        dropin.parent.mkdir()
-        dropin.write_text('[Service]\nLimitNOFILE=65536\nRestartSec=20\n')
-        self.systemd.entry('V2bX-elise@vmess-9.service')['dropins'] = [dropin]
-        self.run_migration()
-        target = self.paths.units / 'elise@vmess-9.service.d/0000-migrated.conf'
-        self.assertEqual(target.read_text(), dropin.read_text())
-
-    def test_environment_overrides_require_review_before_changes(self):
-        self.legacy()
-        dropin = self.paths.units / 'custom.conf'
-        dropin.write_text('[Service]\nEnvironment=ELISE_IP_USER_CACHE_SAVE_DIR=/some/state\n')
-        self.systemd.entry('V2bX-elise@vmess-9.service')['dropins'] = [dropin]
-        with self.assertRaisesRegex(RuntimeError, 'environment overrides'):
-            self.run_migration()
-        self.assertEqual(self.systemd.calls, [])
-
-    def test_unit_dependencies_on_v2bx_are_rejected_before_changes(self):
-        self.legacy()
-        dropin = self.paths.units / 'custom.conf'
-        self.systemd.entry('V2bX-elise@vmess-9.service')['dropins'] = [dropin]
-        for content in ('[Unit]\nRequires=V2bX.service\n',
-                        f'[Service]\nStandardOutput=append:{self.paths.at("/etc/V2bX/elise.log")}\n'):
-            dropin.write_text(content)
-            with self.assertRaisesRegex(RuntimeError, 'depends on V2bX'):
-                self.run_migration()
-        self.assertEqual(self.systemd.calls, [])
 
     def package(self):
         package = Path(self.temp.name) / 'package'
@@ -225,7 +72,39 @@ class DeploymentTests(unittest.TestCase):
         (package / 'elise').chmod(0o755)
         for name in ('elisectl', 'install.sh'):
             (package / name).write_text('#!/bin/bash\ntrue\n')
+        (package / 'migrate.py').write_bytes(Path(__file__).with_name('migrate.py').read_bytes())
         return package
+
+    def existing_installation(self):
+        self.paths.manager.write_text('old manager')
+        self.paths.support.mkdir(parents=True)
+        (self.paths.support / 'migrate.py').write_text('old migration implementation')
+        self.traffic = Path(self.temp.name) / 'external-state/traffic/pending.json'
+        self.traffic.parent.mkdir(parents=True)
+        self.traffic.write_text('{"7":[1,2]}')
+        certificate = Path(self.temp.name) / 'external-cert/key.pem'
+        certificate.parent.mkdir(parents=True)
+        certificate.write_text('keep this private key')
+        preserved = [self.traffic, certificate]
+        for instance, active, enabled in [
+            ('vmess-9', True, 'enabled'), ('anytls-10', False, 'enabled'),
+            ('hysteria2-11', True, 'disabled'), ('vless-12', False, 'disabled'),
+        ]:
+            config = self.paths.config / instance / 'elise.conf'
+            config.parent.mkdir(parents=True)
+            config.write_text(f'ip_user_cache_save_dir={self.traffic.parent.parent}\n'
+                              f'key_file={certificate}\npanel_key=literal +$value;key\n')
+            unit = self.paths.units / f'elise@{instance}.service'
+            unit.write_text(f'[Service]\nWorkingDirectory={config.parent}\n'
+                            f'ExecStart={self.paths.binary} run -c {config}\n')
+            dropin = self.paths.units / f'elise@{instance}.service.d/custom.conf'
+            dropin.parent.mkdir()
+            dropin.write_text('[Service]\nLimitNOFILE=65536\n')
+            preserved.extend([config, unit, dropin])
+            self.systemd.entry(unit.name).update(active=active, enabled=enabled)
+        self.systemd.entry('other.service')['active'] = True
+        states = {unit: entry.copy() for unit, entry in self.systemd.units.items()}
+        return {path: path.read_bytes() for path in preserved}, states
 
     def test_fresh_install_and_version_mismatch(self):
         package = self.package()
@@ -236,24 +115,42 @@ class DeploymentTests(unittest.TestCase):
         self.assertEqual(self.paths.binary.stat().st_mode & 0o777, 0o755)
         self.assertEqual(self.systemd.calls, [('daemon-reload',)])
 
-    def test_upgrade_failure_restores_binary_manager_and_running_states(self):
+    def test_upgrade_retires_migration_and_preserves_custom_units_and_external_state(self):
         package = self.package()
-        for instance in ('vmess-9', 'anytls-10'):
-            config = self.paths.config / instance
-            config.mkdir(parents=True)
-            (config / 'elise.conf').write_text('original config')
-        self.paths.manager.write_text('old manager')
-        self.systemd.entry('elise@vmess-9.service')['active'] = True
-        self.systemd.entry('elise@vmess-9.service')['enabled'] = 'enabled'
+        preserved, states = self.existing_installation()
+        checked = []
+        installer.install(package, 'v1.0.4', self.paths, self.systemd,
+                          health=lambda _paths, instance: checked.append(instance))
+        self.assertCountEqual(checked, ['vmess-9', 'hysteria2-11'])
+        self.assertEqual(self.systemd.units, states)
+        self.assertTrue(all(call[-1] in ('elise@vmess-9.service', 'elise@hysteria2-11.service')
+                            for call in self.systemd.calls if call[0] != 'daemon-reload'))
+        retired = self.paths.support / 'migrate.py'
+        self.assertEqual(retired.read_bytes(), (package / 'migrate.py').read_bytes())
+        result = subprocess.run([sys.executable, str(retired), '--dry-run'],
+                                cwd=self.temp.name, capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('automatic migration has been removed', result.stderr)
+        for path, contents in preserved.items():
+            self.assertEqual(path.read_bytes(), contents, str(path))
+
+    def test_upgrade_failure_restores_programs_and_states_without_rewinding_traffic(self):
+        package = self.package()
+        preserved, states = self.existing_installation()
         def failed_health(_paths, _instance):
+            # A running node can update pending reports before startup checks fail.
+            self.traffic.write_text('{"7":[3,4]}')
             raise RuntimeError('simulated startup failure')
         with self.assertRaisesRegex(RuntimeError, 'startup failure'):
             installer.install(package, 'v1.0.4', self.paths, self.systemd, health=failed_health)
         self.assertEqual(self.paths.binary.read_text(), 'old binary')
         self.assertEqual(self.paths.manager.read_text(), 'old manager')
-        self.assertTrue(self.systemd.active('elise@vmess-9.service'))
-        self.assertFalse(self.systemd.active('elise@anytls-10.service'))
-        self.assertEqual((self.paths.config / 'vmess-9/elise.conf').read_text(), 'original config')
+        self.assertEqual((self.paths.support / 'migrate.py').read_text(), 'old migration implementation')
+        self.assertEqual(self.systemd.units, states)
+        self.assertEqual(self.traffic.read_text(), '{"7":[3,4]}')
+        for path, contents in preserved.items():
+            if path != self.traffic:
+                self.assertEqual(path.read_bytes(), contents, str(path))
 
 
 class BootstrapTests(unittest.TestCase):
@@ -270,7 +167,7 @@ class BootstrapTests(unittest.TestCase):
 
     def prepare(self, invalid_member=False):
         with tarfile.open(self.directory / self.asset, 'w:gz') as archive:
-            for name in installer.release_files(Paths()):
+            for name in REQUIRED_ARCHIVE_FILES:
                 info = tarfile.TarInfo('elise/' + name)
                 data = b'fixture'
                 info.size = len(data)
@@ -306,6 +203,25 @@ test "$resolved_tag" = v1.0.4
         for version in ('v1.0.4', ''):
             result = self.download(version)
             self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_packaged_release_satisfies_published_installer_archive_contract(self):
+        binary = self.directory / 'binary'
+        binary.write_text('#!/bin/sh\necho elise 1.0.4\n')
+        binary.chmod(0o755)
+        subprocess.run(['bash', str(Path(__file__).with_name('package-elise.sh')),
+                        str(binary), 'amd64', str(self.directory)],
+                       check=True, capture_output=True, text=True, timeout=30)
+        with tarfile.open(self.directory / self.asset, 'r:gz') as archive:
+            for name in REQUIRED_ARCHIVE_FILES:
+                self.assertTrue(archive.getmember('elise/' + name).isfile(), name)
+            stub = archive.extractfile('elise/migrate.py').read()
+        (self.directory / 'release.json').write_text(json.dumps(self.release))
+        result = self.download()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = subprocess.run([sys.executable, '-'], input=stub,
+                                cwd=self.directory, capture_output=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b'automatic migration has been removed', result.stderr)
 
     def test_bad_checksum_aborts(self):
         self.prepare()

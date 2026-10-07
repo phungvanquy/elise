@@ -60,7 +60,7 @@ class PurgeTests(unittest.TestCase):
                      'support/install.sh', 'licenses/LICENSE', 'units/elise@.service',
                      'units/elise@vmess-2.service', 'units/elise@vmess-2.service.d/override.conf',
                      'units/elise@.service.d/custom.conf', 'outside/key.pem',
-                     'legacy-v2bx/traffic.json', 'units/other.service', 'bin/other']:
+                     'external-state/traffic.json', 'units/other.service', 'bin/other']:
             path = self.root / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text('keep or remove as owned\n')
@@ -94,7 +94,7 @@ class PurgeTests(unittest.TestCase):
         for name in ['etc/elise', 'state', 'support', 'licenses', 'bin/elise', 'bin/elisectl']:
             self.assertFalse((self.root / name).exists(), name)
         self.assertFalse(list((self.root / 'units').rglob('elise@*')))
-        for name in ['outside/key.pem', 'legacy-v2bx/traffic.json', 'units/other.service',
+        for name in ['outside/key.pem', 'external-state/traffic.json', 'units/other.service',
                      'units/multi-user.target.wants/other.service', 'bin/other']:
             self.assertTrue((self.root / name).exists(), name)
         calls = (self.root / 'services.log').read_text().splitlines()

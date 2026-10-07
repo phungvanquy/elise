@@ -25,9 +25,6 @@ class Paths:
         self.config = self.at('/etc/elise/instances')
         self.units = self.at('/etc/systemd/system')
         self.unit = self.units / 'elise@.service'
-        self.legacy_config = self.at('/etc/v2bx-elise')
-        self.legacy_binary = self.at('/usr/local/libexec/V2bX/elise')
-        self.legacy_helper = self.at('/usr/bin/V2bX-elise')
         self.backups = self.at('/var/lib/elise/backups')
 
     def at(self, absolute):
@@ -46,12 +43,6 @@ class Systemd:
         if state not in ('active', 'inactive', 'failed'):
             raise RuntimeError(f'{unit} is {state}; wait for it to settle before continuing')
         return state == 'active'
-
-    def enabled(self, unit):
-        state = self.property(unit, 'UnitFileState')
-        if state not in ('enabled', 'disabled', 'masked'):
-            raise RuntimeError(f'{unit} has unsupported enable state {state!r}; use a persistent enabled/disabled state first')
-        return state
 
 
 def instances(directory):

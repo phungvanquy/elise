@@ -21,7 +21,7 @@ helper = sys.argv[1]
 
 class Panel(BaseHTTPRequestHandler):
     def do_GET(self):
-        assert self.headers.get('User-Agent') == 'V2bX-Elise/1.0'
+        assert self.headers.get('User-Agent') == 'Elise/1.0'
         query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         assert query == {'node_type': [panel_kind], 'node_id': ['9'], 'token': ['key+value']}, query
         payload = json.dumps(panel_payload).encode()
@@ -61,14 +61,9 @@ try:
             f'type=xboard\npanel_url=http://127.0.0.1:{server.server_port}\n'
             'panel_key=key+value\npanel_node_type=vmess\nnode_id=9\nlisten=127.0.0.1\n'
         )
-        v2bx_config = Path(root) / 'config.json'
-        v2bx_config.write_text('{"Nodes":[{"ApiConfig":{"NodeType":"vmess","NodeID":9},},],} // comment\n')
         env = os.environ.copy()
-        env['V2BX_CONFIG_PATH'] = str(v2bx_config)
         command = (
             'helper=$1; panel=$2; set --; source "$helper" >/dev/null; '
-            'if check_v2bx_assignment vmess 9 >/dev/null 2>&1; then exit 1; fi; '
-            'check_v2bx_assignment vless 9; '
             'panel_port_and_security "$panel"'
         )
         result = subprocess.run(
@@ -166,17 +161,8 @@ try:
         result = run_helper('wait_node_port 127.0.0.1 "$1" udp 0.5', port)
         assert result.returncode != 0 and 'did not open' in result.stderr, result
 
-        for kind in ('vmess', 'anytls', 'hysteria', 'hysteria2'):
-            v2bx_config.write_text(json.dumps({'Nodes': [{'NodeType': kind, 'NodeID': 9}]}))
-            result = run_helper('check_v2bx_assignment "$1" 9', kind)
-            assert result.returncode != 0 and 'already managed' in result.stderr, result
-        for alias, kind in [('hysteria1', 'hysteria'), ('hy1', 'hysteria'), ('hy2', 'hysteria2')]:
-            v2bx_config.write_text(json.dumps({'Nodes': [{'NodeType': alias, 'NodeID': 9}]}))
-            assert run_helper('check_v2bx_assignment "$1" 9', kind).returncode != 0
-
         # Exercise node creation and management against a fake systemd that
         # opens real local sockets, without writing to system directories.
-        v2bx_config.write_text('{"Nodes":[]}')
         cert = Path(root) / 'cert.pem'
         key = Path(root) / 'key.pem'
         subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',

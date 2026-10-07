@@ -24,5 +24,12 @@ testing. Cargo.lock remains committed.
 The Hysteria interoperability fixture now has its own module in
 `tests/interop/hysteria2`, pinning Hysteria core/extras v2.12.2 and the same
 apernet/quic-go revision used at extraction. Optional Tunnio testing still needs
-an explicit `TUNNIO_CORE_DIR`. The historical `V2bX-Elise/1.0` XBoard user agent
-is retained for existing panel/WAF rules.
+an explicit `TUNNIO_CORE_DIR`. XBoard and V2Board UniProxy requests now use the
+standalone `Elise/1.0` user agent.
+
+Automatic migration support has been removed. Release archives retain an inert
+`migrate.py` entry because already released Elise installers require that filename
+before they can install an update. Installing the stub also replaces any old
+migration implementation; running it exits with an explanation and changes no
+files or services. Existing instance configurations, custom service units, and
+external traffic-state paths are preserved during updates.

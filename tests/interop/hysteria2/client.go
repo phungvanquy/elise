@@ -1,4 +1,4 @@
-// Interoperability fixture using the exact Hysteria core pinned by V2bX.
+// Interoperability fixture using the Hysteria core pinned in this module.
 package main
 
 import (

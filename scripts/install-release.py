@@ -17,6 +17,7 @@ def release_files(paths):
         'elisectl': (paths.manager, 0o755),
         'install.sh': (paths.support / 'install.sh', 0o755),
         'install-release.py': (paths.support / 'install-release.py', 0o644),
+        # Replace the retired migration implementation with the archive's stub.
         'migrate.py': (paths.support / 'migrate.py', 0o644),
         'runtime.py': (paths.support / 'runtime.py', 0o644),
         'elise@.service': (paths.unit, 0o644),

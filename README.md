@@ -1,10 +1,10 @@
 # Elise
 
-Elise is a Rust node backend configured by default for
+Elise is a standalone Rust node backend configured by default for
 [phungvanquy/v2board-new](https://github.com/phungvanquy/v2board-new), with optional
 support for XBoard, XiaoV2Board, PPanel, and SSPanel. This repository owns its source, releases, installation tools, and
 service management. Each installer-managed panel node runs in its own systemd
-service. V2bX is not required to build, install, or run Elise.
+service.
 
 To remove an existing installation, see [Completely uninstall Elise](#completely-uninstall-elise).
 
@@ -30,9 +30,9 @@ If Elise is already installed, go straight to adding a node.
 - Allow the node's listening port through your firewall: TCP for VLESS, VMess,
   and AnyTLS; UDP for Hysteria 1/2. Automatic certificates also need TCP port 80.
 
-A panel node must have only one backend owner. If V2bX already manages this
-node, remove its assignment before adding it to Elise. To move an existing
-`v2bx elise` installation, use the [migration guide](docs/migration.md).
+A panel node must have only one backend owner. Stop any other backend managing
+that node before adding it to Elise. Elise does not inspect other backends'
+configurations or import their installations automatically.
 
 ### Choose your panel type
 
@@ -78,9 +78,8 @@ sudo bash /tmp/elise-install.sh install v1.0.8
 ```
 
 The installer verifies the release archive's SHA-256 checksum and installs the
-binary, manager, service template, and migration tools from that same archive.
+binary, manager, service template, and installation tools from that same archive.
 It checks that the Rust binary version matches the requested release tag.
-Legacy V2bX-managed services are not started by installation.
 
 ### Install and start a node in one command
 
@@ -206,14 +205,14 @@ See [installation troubleshooting](#installation-troubleshooting) if startup fai
 | --- | --- |
 | Core executable | `/usr/local/bin/elise` |
 | Manager | `/usr/local/bin/elisectl` |
-| Installation and migration tools | `/usr/local/lib/elise/` |
+| Installation tools | `/usr/local/lib/elise/` |
 | Instance configuration | `/etc/elise/instances/<protocol-id>/elise.conf` |
 | State for newly added nodes | `/var/lib/elise/<protocol-id>/` |
 | Service | `elise@<protocol-id>.service` |
-| Installation/migration backups | `/var/lib/elise/backups/` |
+| Installation backups | `/var/lib/elise/backups/` |
 
-Migrated nodes retain their original traffic-state location explicitly. Keep
-legacy configuration directories after migration; see the migration guide.
+Existing nodes may use custom certificate or traffic-state paths. Preserve the
+files at the paths recorded in `elise.conf` when updating or moving an installation.
 
 ## V2Board API compatibility
 
@@ -388,7 +387,7 @@ batches up to three attempts. These are best-effort diagnostic logs: failures ca
 records, and a retry after a lost acknowledgement can duplicate records. ClickHouse
 server-side retention/TTL must be configured on its table separately.
 
-## Update, migration, and removal
+## Update and removal
 
 ```bash
 sudo elisectl update          # latest stable Elise release
@@ -400,16 +399,11 @@ instances and boot enable states, and attempt to restore previous files and
 services if startup checks fail. Configurations, certificates, and traffic state
 are not reset. Connections on restarted instances will be interrupted.
 
-For existing `v2bx elise` installations, first install standalone Elise, then:
-
-```bash
-sudo elisectl migrate --from-v2bx --dry-run
-sudo elisectl migrate --from-v2bx
-```
-
-Read [migration and recovery](docs/migration.md) before migrating. Supported
-service settings and certificates are retained. Custom runtime overrides may
-require manual adaptation, detected before stopping legacy services.
+XBoard and V2Board UniProxy requests now use the `Elise/1.0` user agent, including
+XBoard installation checks. If your panel or WAF matches the previous user agent,
+allow `Elise/1.0` before updating. Automatic migration is no longer available;
+set up nodes with `elisectl add`. Existing instance configurations and custom
+service units continue to work.
 
 `elisectl uninstall` stops and disables instances and removes the core and
 shared service template. Configuration, state, service overrides, and the manager
@@ -451,16 +445,15 @@ directly without downloading anything:
 sudo elisectl purge --yes
 ```
 
-Purge stops all discovered `elise@` instance services, including orphaned and migrated
+Purge stops all discovered `elise@` instance services, including orphaned and custom
 units, before deleting files. It removes `/etc/elise`, `/var/lib/elise` (including
 backups and pending traffic), `/usr/local/lib/elise`, `/usr/local/share/licenses/elise`,
 both `elise` and `elisectl` binaries, and Elise's systemd template, instance units,
 drop-ins and enablement links. If a service cannot be stopped, no files are deleted.
 `--yes` is required; this cannot be undone. The command also works after `uninstall`.
 
-External certificate/log/state paths, original V2bX directories, and the host's system
-journal are preserved. Symlinks inside Elise's directories are removed without deleting
-their external targets.
+External certificate/log/state paths and the host's system journal are preserved.
+Symlinks inside Elise's directories are removed without deleting their external targets.
 
 ## Build and test
 
@@ -479,14 +472,14 @@ Rust is pinned by `rust-toolchain.toml`. Go is needed only for interoperability
 tests, with its version and dependencies pinned in `tests/interop/hysteria2`:
 
 ```bash
-cargo test --locked --test hysteria2_v2bx -- --ignored --nocapture
+cargo test --locked --test hysteria2_interop -- --ignored --nocapture
 cargo test --locked --manifest-path vendor/quinn-proto/Cargo.toml
 ```
 
 CI builds musl release archives for amd64 and arm64 with `cross`. The tagged
 release workflow runs checks before publishing both archives and checksums.
 See [source provenance](docs/provenance.md) for the history extraction and local
-TLS/QUIC patches. Source builds do not depend on a V2bX checkout.
+TLS/QUIC patches.
 
 ## Licenses
 

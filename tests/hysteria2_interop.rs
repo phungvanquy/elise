@@ -9,7 +9,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test]
 #[ignore = "requires Go and the pinned interoperability fixture dependencies"]
-async fn v2bx_hysteria2_tcp_udp_and_bandwidth_negotiation() {
+async fn hysteria2_tcp_udp_and_bandwidth_negotiation() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_test_writer()

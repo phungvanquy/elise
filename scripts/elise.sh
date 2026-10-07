@@ -8,7 +8,6 @@ config_dir="/etc/elise/instances"
 state_dir="/var/lib/elise"
 support_dir="/usr/local/lib/elise"
 license_dir="/usr/local/share/licenses/elise"
-v2bx_config="${V2BX_CONFIG_PATH:-/etc/V2bX/config.json}"
 unit_file="/etc/systemd/system/elise@.service"
 work=""
 trap '[[ -z "$work" ]] || rm -rf -- "$work"' EXIT
@@ -101,82 +100,6 @@ health_check() {
         systemctl is-active --quiet "$(instance_unit "$instance")"
 }
 
-check_v2bx_assignment() {
-    python3 - "$1" "$2" "$v2bx_config" <<'PY'
-import json, pathlib, sys
-kind, node_id = sys.argv[1], int(sys.argv[2])
-path = pathlib.Path(sys.argv[3])
-if not path.exists():
-    sys.exit(0)
-source = path.read_text()
-clean = []
-i = 0
-quoted = False
-while i < len(source):
-    char = source[i]
-    if quoted:
-        clean.append(char)
-        if char == '\\' and i + 1 < len(source):
-            i += 1
-            clean.append(source[i])
-        elif char == '"':
-            quoted = False
-    elif char == '"':
-        quoted = True
-        clean.append(char)
-    elif source.startswith('//', i):
-        while i < len(source) and source[i] not in '\r\n':
-            i += 1
-        continue
-    elif source.startswith('/*', i):
-        end = source.find('*/', i + 2)
-        if end < 0:
-            sys.exit('unterminated comment in V2bX config')
-        i = end + 2
-        continue
-    else:
-        clean.append(char)
-    i += 1
-source = ''.join(clean)
-clean = []
-i = 0
-quoted = False
-while i < len(source):
-    char = source[i]
-    if quoted:
-        clean.append(char)
-        if char == '\\' and i + 1 < len(source):
-            i += 1
-            clean.append(source[i])
-        elif char == '"':
-            quoted = False
-    elif char == '"':
-        quoted = True
-        clean.append(char)
-    elif char == ',':
-        j = i + 1
-        while j < len(source) and source[j].isspace():
-            j += 1
-        if j >= len(source) or source[j] not in '}]':
-            clean.append(char)
-    else:
-        clean.append(char)
-    i += 1
-try:
-    data = json.loads(''.join(clean))
-except (ValueError, OSError) as exc:
-    sys.exit(f'cannot verify V2bX node assignments in {path}: {exc}')
-for node in data.get('Nodes', []):
-    if node.get('Include'):
-        sys.exit('V2bX node includes must be reviewed before adding an Elise node')
-    api = node.get('ApiConfig') or node
-    node_kind = str(api.get('NodeType', '')).lower()
-    node_kind = {'v2ray': 'vmess', 'hysteria1': 'hysteria', 'hy1': 'hysteria', 'hy2': 'hysteria2'}.get(node_kind, node_kind)
-    if node_kind == kind and api.get('NodeID') == node_id:
-        sys.exit(f'{kind} node {node_id} is already managed by the V2bX Go service')
-PY
-}
-
 panel_port_and_security() {
     python3 - "$1" "${2:-}" "$binary" <<'PY'
 import pathlib, socket, subprocess, sys, urllib.parse, urllib.request, json
@@ -197,7 +120,7 @@ if panel_type == 'xboard':
     query = urllib.parse.urlencode({'node_type': kind, 'node_id': values['node_id'], 'token': values['panel_key']})
     url = values['panel_url'].rstrip('/') + '/api/v1/server/UniProxy/config?' + query
     try:
-        request = urllib.request.Request(url, headers={'User-Agent': 'V2bX-Elise/1.0'})
+        request = urllib.request.Request(url, headers={'User-Agent': 'Elise/1.0'})
         with urllib.request.urlopen(request, timeout=15) as response:
             payload = json.load(response)
         data = payload.get('data', payload)
@@ -491,8 +414,6 @@ sys.exit(0 if int(sys.argv[1]) <= 4294967295 else 1)
 PY
     instance="$kind-$node_id"; target=$(instance_dir "$instance")
     [[ ! -e "$target" && ! -L "$target" ]] || die "$instance already exists; edit its config or remove it first"
-    [[ ! -f "/etc/v2bx-elise/$instance/elise.conf" ]] || die "legacy instance exists; use elisectl migrate --from-v2bx"
-    check_v2bx_assignment "$kind" "$node_id" || die "remove this node from /etc/V2bX/config.json before adding it to Elise"
     if [[ "$non_interactive" == false ]]; then
         read -rp 'Panel URL: ' panel_url
     fi
@@ -596,7 +517,7 @@ remove_node() {
         systemctl stop "$(instance_unit "$instance")" || die "could not stop $instance"
     fi
     systemctl disable "$(instance_unit "$instance")" >/dev/null 2>&1 || true
-    # A migrated node has its own unit and effective drop-ins.
+    # Remove any instance-specific unit and drop-ins as well as its config.
     local service_dir=${unit_file%/*}
     rm -f -- "$service_dir/$(instance_unit "$instance")"
     rm -rf -- "$service_dir/$(instance_unit "$instance").d"
@@ -620,7 +541,7 @@ uninstall_all() {
 }
 
 # Purge only the standalone installation's namespaces. Never chase configured
-# certificate/log/state paths: migrated instances can reference V2bX-owned data.
+# certificate/log/state paths: instances can reference externally managed data.
 purge_all() {
     [[ $# -eq 1 && "$1" == --yes ]] || die "purge permanently deletes Elise configuration, certificates, state and backups; run: elisectl purge --yes"
     need_root; need_systemd
@@ -629,7 +550,7 @@ purge_all() {
     local -A units=()
     [[ "$config_root" != "$config_dir" && -n "$config_root" && "$config_root" != / ]] || die "invalid Elise configuration directory"
 
-    # Include orphaned/failed services and migrated instance units, even after
+    # Include orphaned/failed services and custom instance units, even after
     # uninstall removed the template or a configuration file was deleted.
     listed=$(systemctl list-units --all --plain --no-legend 'elise@*.service') || die "could not enumerate Elise services"
     while read -r unit rest; do
@@ -673,7 +594,7 @@ purge_all() {
     rm -rf --one-file-system -- "$config_root" "$state_dir" "$support_dir" "$license_dir"
     rm -f -- "$binary" "$bin_dir/elisectl"
     echo "Elise purged: services, binaries, configuration, local certificates, state and backups removed."
-    echo "External files, legacy V2bX data and the system journal were preserved."
+    echo "External files and the system journal were preserved."
 }
 
 usage() {
@@ -686,7 +607,6 @@ Usage: elisectl install|update [Elise release version]
        elisectl remove <protocol-id>
        elisectl uninstall
        elisectl purge --yes
-       elisectl migrate --from-v2bx [--dry-run]
 
 Hysteria aliases: hysteria1/hy1 -> hysteria; hy2 -> hysteria2.
 Panels: v2board (default, unified V2Node), v2board-uniproxy (protocol nodes), xboard, xiaov2board (xiaov2b), ppanel, sspanel (sspanel-uim).
@@ -703,7 +623,7 @@ Options accept --name=value or --name value. Existing instances are never overwr
 remove deletes the selected instance configuration and certificates.
 uninstall retains all configuration and state; install restores the binary.
 purge --yes permanently removes standalone Elise configuration, local certificates,
-state, backups, service overrides, binaries and manager; external/V2bX files remain.
+state, backups, service overrides, binaries and manager; external files remain.
 EOF
 }
 
@@ -728,9 +648,7 @@ main() {
         remove) shift; remove_node "${1:-}" ;;
         uninstall) uninstall_all ;;
         purge) shift; purge_all "$@" ;;
-        migrate) shift; need_root; need_systemd; ensure_python; exec python3 "$support_dir/migrate.py" "$@" ;;
         __health) shift; health_check "$1" ;;
-        __preflight) shift; panel_port_and_security "$1" no-bind ;;
         help|-h|--help|'') usage ;;
         *) usage; return 2 ;;
     esac

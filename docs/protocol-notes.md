@@ -8,14 +8,14 @@ For native configuration, `cert_mode=http` (alias `acme`) enables automatic HTTP
 
 ## Hysteria 2
 
-Elise follows V2bX's bandwidth negotiation: a client with a receive rate uses a paced Brutal controller, capped by the panel's `up_mbps`; a client advertising zero uses BBR. Panel directions are from the server's perspective: `up_mbps` is server transmit and `down_mbps` is server receive. Both are converted from Mbps to bytes per second for the [Hysteria 2 protocol](https://v2.hysteria.network/docs/developers/Protocol/). A zero server receive limit is advertised as `0` (unlimited), preserving the client's requested upload rate. `ignore_client_bandwidth` (also `ignoreClientBandwidth`) selects BBR and advertises `auto` instead. Brutal's loss compensation is bounded to 25%; Quinn supplies byte-based loss samples.
+For Hysteria 2 bandwidth negotiation, a client with a receive rate uses a paced Brutal controller, capped by the panel's `up_mbps`; a client advertising zero uses BBR. Panel directions are from the server's perspective: `up_mbps` is server transmit and `down_mbps` is server receive. Both are converted from Mbps to bytes per second for the [Hysteria 2 protocol](https://v2.hysteria.network/docs/developers/Protocol/). A zero server receive limit is advertised as `0` (unlimited), preserving the client's requested upload rate. `ignore_client_bandwidth` (also `ignoreClientBandwidth`) selects BBR and advertises `auto` instead. Brutal's loss compensation is bounded to 25%; Quinn supplies byte-based loss samples.
 
-Authentication retries preserve the connection's original user and negotiated rate. With domain sniffing enabled for an IP target, Elise sends the TCP acceptance before reading application data, as V2bX's request hook does; a later audit or dial failure closes the stream. UDP replies support Go clients that omit the datagram transport parameter in their Chrome-style handshake. Obfuscated UDP receives split kernel-coalesced packets before decoding each salt, and listeners request larger kernel send/receive buffers subject to OS limits.
+Authentication retries preserve the connection's original user and negotiated rate. With domain sniffing enabled for an IP target, Elise sends the TCP acceptance before reading application data so clients waiting for acceptance can send the bytes needed by the sniffer; a later audit or dial failure closes the stream. UDP replies support Go clients that omit the datagram transport parameter in their Chrome-style handshake. Obfuscated UDP receives split kernel-coalesced packets before decoding each salt, and listeners request larger kernel send/receive buffers subject to OS limits.
 
 Run the Hysteria unit tests with `cargo test --locked --lib protocol::hysteria`. From this directory, the optional interoperability test builds the Hysteria Go client pinned in `tests/interop/hysteria2` and checks concurrent TCP, sniffed audit rules, fragmented UDP, Salamander, and bandwidth negotiation:
 
 ```bash
-cargo test --locked --test hysteria2_v2bx -- --ignored --nocapture
+cargo test --locked --test hysteria2_interop -- --ignored --nocapture
 ```
 
 ## Online IP limits

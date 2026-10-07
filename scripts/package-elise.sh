@@ -26,6 +26,7 @@ cp -a "$root/example" "$stage/elise/example"
 
 install -m 0755 "$root/scripts/elise.sh" "$stage/elise/elisectl"
 install -m 0755 "$root/install.sh" "$stage/elise/install.sh"
+# Earlier standalone installers require migrate.py; package only its retirement stub.
 for file in install-release.py migrate.py runtime.py elise@.service; do
     install -m 0644 "$root/scripts/$file" "$stage/elise/$file"
 done

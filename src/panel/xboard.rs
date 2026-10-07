@@ -40,7 +40,7 @@ impl XboardClient {
     pub fn new_with_node_type(base_url: String, token: String, node_type: Option<String>) -> Self {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(15))
-            .user_agent("V2bX-Elise/1.0")
+            .user_agent("Elise/1.0")
             .build()
             .unwrap_or_default();
 
@@ -596,7 +596,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
-    async fn v2bx_anytls_and_hysteria_resolve_panel_types_and_versions() {
+    async fn anytls_and_hysteria_resolve_panel_types_and_versions() {
         for (configured, reported, version, expected) in [
             ("anytls", "AnyTLS", None, Some("anytls")),
             ("hysteria", "hysteria1", Some(1), Some("hysteria")),
@@ -664,7 +664,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v2bx_vmess_uses_typed_uniproxy_requests_and_alive_map() {
+    async fn vmess_uses_typed_uniproxy_requests_and_alive_map() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client = XboardClient::new_with_node_type(
             format!("http://{}", listener.local_addr().unwrap()),
@@ -686,7 +686,7 @@ mod tests {
                 let request = String::from_utf8(request).unwrap();
                 assert!(request
                     .to_ascii_lowercase()
-                    .contains("user-agent: v2bx-elise/1.0\r\n"));
+                    .contains("user-agent: elise/1.0\r\n"));
                 let target = request.split_whitespace().nth(1).unwrap();
                 let url = reqwest::Url::parse(&format!("http://localhost{target}")).unwrap();
                 assert!(url.path().ends_with(path));

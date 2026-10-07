@@ -32,7 +32,7 @@ jobs:
           git diff --exit-code -- go.mod go.sum
           go mod verify
       - name: Hysteria 2 interoperability
-        run: cargo test --locked --test hysteria2_v2bx -- --ignored --nocapture
+        run: cargo test --locked --test hysteria2_interop -- --ignored --nocapture
       - name: Patched QUIC regression tests
         run: cargo test --locked --manifest-path vendor/quinn-proto/Cargo.toml
   scripts:
