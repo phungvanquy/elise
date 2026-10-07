@@ -6,6 +6,8 @@ support for XBoard, XiaoV2Board, PPanel, and SSPanel. This repository owns its s
 service management. Each installer-managed panel node runs in its own systemd
 service. V2bX is not required to build, install, or run Elise.
 
+To remove an existing installation, see [Completely uninstall Elise](#completely-uninstall-elise).
+
 ## Installation
 
 For a first installation, [choose your panel type](#choose-your-panel-type),
@@ -414,7 +416,16 @@ stopping it. External certificates and retained state are not deleted.
 ### Completely uninstall Elise
 
 To permanently remove **all standalone Elise instances and their retained data**,
-download and run `uninstall.sh`:
+run this **online uninstall command** on your server (no repository clone needed):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/phungvanquy/elise/refs/heads/main/uninstall.sh | sudo bash -s -- --yes
+```
+
+If you are already logged in as root, omit `sudo`. `--yes` confirms permanent
+deletion of Elise's data.
+
+Alternatively, download the script first, then run it:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/phungvanquy/elise/refs/heads/main/uninstall.sh -o /tmp/elise-uninstall.sh &&
