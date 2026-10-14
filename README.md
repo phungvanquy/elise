@@ -70,11 +70,11 @@ Next, [add your first node](#add-and-manage-nodes). The `elise` command is the
 core executable; `elisectl` configures nodes and manages their services.
 
 To install a specific version, pin both the bootstrap script and release.
-For example, to install v1.0.8:
+For example, to install v1.0.9:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/phungvanquy/elise/refs/tags/v1.0.8/install.sh -o /tmp/elise-install.sh &&
-sudo bash /tmp/elise-install.sh install v1.0.8
+curl -fsSL https://raw.githubusercontent.com/phungvanquy/elise/refs/tags/v1.0.9/install.sh -o /tmp/elise-install.sh &&
+sudo bash /tmp/elise-install.sh install v1.0.9
 ```
 
 The installer verifies the release archive's SHA-256 checksum and installs the
@@ -250,10 +250,17 @@ Match the security mode configured in the panel:
 
 | Node security | Options to add to `elisectl add` or the installer |
 | --- | --- |
-| VLESS with REALITY | No certificate options; configure matching REALITY keys in the panel |
+| VLESS or AnyTLS with REALITY | No certificate options; configure matching REALITY keys in the panel |
 | VLESS or VMess without TLS | No certificate options |
 | VLESS or VMess with certificate TLS | Choose one certificate mode below |
-| AnyTLS, Hysteria 1, or Hysteria 2 | Always choose one certificate mode below |
+| AnyTLS with certificate TLS, Hysteria 1, or Hysteria 2 | Choose one certificate mode below |
+
+AnyTLS defaults to certificate TLS when the panel omits the security mode. An
+explicit `tls=2` selects REALITY; plaintext AnyTLS (`tls=0`) is rejected. For an
+AnyTLS + REALITY entry in the unified V2Node section, use `--node-type=anytls`
+with `--panel-type=v2board`. The separate AnyTLS section's UniProxy API currently
+omits REALITY settings, so those entries continue to use certificate TLS. Other
+panel APIs can use REALITY when they supply `tls=2` and the corresponding settings.
 
 REALITY destinations accept a hostname or IP with an optional port; the default
 is `tls_settings.server_port` or 443. For example, `visualstudio.microsoft.com`
@@ -391,7 +398,7 @@ server-side retention/TTL must be configured on its table separately.
 
 ```bash
 sudo elisectl update          # latest stable Elise release
-sudo elisectl update v1.0.8   # explicit Elise version
+sudo elisectl update v1.0.9   # explicit Elise version
 ```
 
 Updates restart only currently running standalone instances, preserve stopped
@@ -469,10 +476,14 @@ python3 scripts/test-deploy.py
 ```
 
 Rust is pinned by `rust-toolchain.toml`. Go is needed only for interoperability
-tests, with its version and dependencies pinned in `tests/interop/hysteria2`:
+tests, with its version and dependencies pinned in `tests/interop/hysteria2`
+and `tests/interop/anytls`. The AnyTLS client checks REALITY certificate
+authentication, multiplexed forwarding, invalid credentials, ALPN, and PROXY
+protocol v1/v2:
 
 ```bash
 cargo test --locked --test hysteria2_interop -- --ignored --nocapture
+cargo test --locked --test anytls -- --ignored --nocapture
 cargo test --locked --manifest-path vendor/quinn-proto/Cargo.toml
 ```
 

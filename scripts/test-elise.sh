@@ -96,6 +96,7 @@ try:
         for kind, payload, security, transport in [
             ('vless', {'tls': 1}, 1, 'tcp'),
             ('anytls', {'server_type': 'AnyTLS'}, 1, 'tcp'),
+            ('anytls', {'tls': 2, 'tls_settings': {'private_key': 'private', 'public_key': 'public'}}, 2, 'tcp'),
             ('hysteria', {'server_type': 'hysteria1', 'version': 1}, 1, 'udp'),
             ('hysteria', {'server_type': 'hysteria', 'version': 2}, 1, 'udp'),
             ('hysteria2', {'server_type': 'hysteria', 'version': 2}, 1, 'udp'),
@@ -107,7 +108,8 @@ try:
 
         for kind, payload, error in [
             ('anytls', {'tls': 0}, 'requires TLS'),
-            ('anytls', {'tls': 2}, 'requires TLS'),
+            ('anytls', {'tls': 2}, 'REALITY requires'),
+            ('anytls', {'tls': 3}, 'requires TLS'),
             ('hysteria', {'tls': 0}, 'requires TLS'),
             ('hysteria2', {'tls': 2}, 'requires TLS'),
             ('hysteria2', {'server_type': 'hysteria', 'version': 1}, 'expected hysteria2'),
@@ -251,8 +253,32 @@ print(os.environ['ELISE_TEST_NODE_INFO'])
             server.node_listener.close()
             server.node_listener = None
 
+        # V2Node reports only key presence to the installer; REALITY must not
+        # prompt for certificates or write certificate options into the config.
+        with socket.socket() as sock:
+            sock.bind(('127.0.0.1', 0))
+            server.node_port = sock.getsockname()[1]
+        env['ELISE_TEST_PANEL'] = 'v2board'
+        env['ELISE_TEST_NODE_INFO'] = json.dumps({
+            'server_type': 'anytls', 'server_port': server.node_port,
+            'tls': 2, 'reality_keys_present': True,
+        })
+        result = run_helper(
+            native_setup + 'add_node anytls 9 v2board', config_root, 'v2board', panel_binary,
+            input=f'http://127.0.0.1:{server.server_port}\nkey+value\n127.0.0.1\n', check=True,
+        )
+        config = config_root / 'anytls-9/elise.conf'
+        contents = config.read_text()
+        assert 'type=v2board\n' in contents and 'panel_node_type=anytls\n' in contents
+        assert 'cert_mode=' not in contents and 'cert_file=' not in contents and 'key_file=' not in contents
+        assert not (config.parent / 'cert').exists()
+        run_helper(service_setup + 'remove_node anytls-9', config_root, check=True)
+        server.node_listener.close()
+        server.node_listener = None
+
         result = run_helper(service_setup + 'add_node anytls 9 unknown', config_root)
         assert result.returncode != 0 and 'panel must be' in result.stderr
+        env['ELISE_TEST_PANEL'] = 'sspanel'
         env['ELISE_TEST_NODE_INFO'] = json.dumps({'server_type': 'vmess', 'server_port': server.node_port, 'tls': 1})
         result = run_helper(native_setup + 'add_node anytls 9 "$1"', config_root, 'sspanel', panel_binary,
                             input=f'http://127.0.0.1:{server.server_port}\nkey+value\n127.0.0.1\n')
@@ -339,6 +365,7 @@ print(os.environ['ELISE_TEST_NODE_INFO'])
         for requested, kind, payload, tls_args in [
             ('vmess', 'vmess', {'tls': 0}, []),
             ('vless', 'vless', {'tls': 2, 'tls_settings': {'private_key': 'private', 'public_key': 'public'}}, []),
+            ('anytls', 'anytls', {'tls': 2, 'tls_settings': {'private_key': 'private', 'public_key': 'public'}}, []),
             ('AnyTLS', 'anytls', {}, ['--cert-mode=file', '--cert-file', cert, '--key-file', key]),
             ('hy2', 'hysteria2', {}, ['--cert-mode=http', '--domain=node.example.com', '--email=admin@example.com']),
             ('hy1', 'hysteria', {}, ['--cert-mode=self-signed', '--domain=node.example.com']),
@@ -370,6 +397,9 @@ print(os.environ['ELISE_TEST_NODE_INFO'])
                 assert (config.parent / 'cert/privkey.pem').stat().st_mode & 0o777 == 0o600
                 assert_self_signed_validity(config.parent / 'cert/fullchain.pem')
                 assert 'valid for 3650 days' in result.stdout
+            if kind == 'anytls' and payload.get('tls') == 2:
+                assert 'cert_mode=' not in contents and 'cert_file=' not in contents and 'key_file=' not in contents
+                assert not (config.parent / 'cert').exists()
             before_services = service_log.read_bytes()
             again = run_helper(setup + 'add_node "$@"', config_root, *options, input='')
             assert again.returncode != 0 and 'already exists' in again.stderr

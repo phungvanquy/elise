@@ -20,6 +20,8 @@ pub use session::{
 use crate::conn::{bind_tcp_listener, read_proxy_protocol, BoxedStream};
 use crate::panel::types::{NodeInfo, User};
 use crate::protocol::{Inbound, InboundContext};
+use crate::security::reality::{RealityHandshakeResult, RealityServer};
+use crate::transport::TransportSecurityConfig;
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use sha2::{Digest as Sha2Digest, Sha256};
@@ -35,6 +37,14 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 pub const PASSWORD_LEN: usize = 32;
+
+enum AnyTlsSecurity {
+    Tls,
+    Reality {
+        server: RealityServer,
+        alpn: Vec<Vec<u8>>,
+    },
+}
 
 pub struct AnytlsInbound {
     users: Arc<RwLock<Arc<HashMap<[u8; PASSWORD_LEN], Arc<User>>>>>,
@@ -89,32 +99,57 @@ impl Inbound for AnytlsInbound {
         mut node_info: NodeInfo,
         mut shutdown_rx: broadcast::Receiver<()>,
     ) -> std::io::Result<()> {
-        if node_info.tls.is_some_and(|mode| mode != 1) {
+        // Protocol-specific panel APIs may omit the mode. Preserve certificate
+        // TLS as the default, while keeping an explicit REALITY mode intact.
+        let tls_mode = *node_info.tls.get_or_insert(1);
+        if !matches!(tls_mode, 1 | 2) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
-                "AnyTLS requires TLS",
+                "AnyTLS requires TLS or REALITY (tls=1 or tls=2)",
             ));
         }
-        node_info.tls = Some(1);
         let settings = crate::transport::StreamSettings::from_node_info(&node_info)
             .map_err(std::io::Error::other)?;
-        let crate::transport::TransportSecurityConfig::Tls(tls_cfg) = settings.security else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "AnyTLS requires TLS",
-            ));
-        };
-        ctx.tls_manager = Arc::new(
-            crate::security::TLSManager::from_config(
-                &tls_cfg,
-                ctx.global_config.auto_tls,
-                &ctx.global_config.fake_sni,
-            )
-            .map_err(std::io::Error::other)?,
-        );
+        let security = Arc::new(match settings.security {
+            TransportSecurityConfig::Tls(tls_cfg) => {
+                ctx.tls_manager = Arc::new(
+                    crate::security::TLSManager::from_config(
+                        &tls_cfg,
+                        ctx.global_config.auto_tls,
+                        &ctx.global_config.fake_sni,
+                    )
+                    .map_err(std::io::Error::other)?,
+                );
+                AnyTlsSecurity::Tls
+            }
+            TransportSecurityConfig::Reality(reality_cfg) => {
+                let alpn = node_info
+                    .tls_settings
+                    .as_ref()
+                    .and_then(|tls| tls.get("alpn"))
+                    .or(node_info.alpn.as_ref())
+                    .map(|value| match value {
+                        serde_json::Value::Array(values) => values
+                            .iter()
+                            .filter_map(|v| v.as_str().map(|s| s.as_bytes().to_vec()))
+                            .collect(),
+                        serde_json::Value::String(value) => vec![value.as_bytes().to_vec()],
+                        _ => Vec::new(),
+                    })
+                    .unwrap_or_default();
+                AnyTlsSecurity::Reality {
+                    server: RealityServer::new(reality_cfg).map_err(std::io::Error::other)?,
+                    alpn,
+                }
+            }
+            TransportSecurityConfig::None => unreachable!("AnyTLS security mode was validated"),
+        });
         let cfg = AnyTlsNodeConfig::from_node_info(&node_info).map_err(std::io::Error::other)?;
         *self.padding_scheme.write() = cfg.protocol.padding_scheme;
-        info!("AnyTLS configuration loaded successfully from node info");
+        info!(
+            security = if tls_mode == 2 { "REALITY" } else { "TLS" },
+            "AnyTLS configuration loaded successfully from node info"
+        );
 
         let bind_addr = match ctx.listen_addr.parse::<IpAddr>() {
             Ok(address) => SocketAddr::new(address, ctx.port).to_string(),
@@ -151,6 +186,7 @@ impl Inbound for AnytlsInbound {
                     let ctx = ctx.clone();
                     let users = users.clone();
                     let padding_scheme = padding_scheme.clone();
+                    let security = security.clone();
                     let session_cancel = top_cancel.child_token();
 
                     connection_tasks.spawn(async move {
@@ -161,6 +197,7 @@ impl Inbound for AnytlsInbound {
                             users,
                             padding_scheme,
                             session_cancel,
+                            security,
                         ).await;
                     });
                 }
@@ -195,19 +232,24 @@ async fn handle_connection(
     users: Arc<RwLock<Arc<HashMap<[u8; PASSWORD_LEN], Arc<User>>>>>,
     padding_scheme: Arc<RwLock<Arc<CompiledPaddingScheme>>>,
     session_cancel: CancellationToken,
+    security: Arc<AnyTlsSecurity>,
 ) -> std::io::Result<()> {
-    let handshake_fut = perform_handshake(stream, remote_addr, &ctx, &users);
-    let (stream, user, client_ip, local_ip, conn_guard) =
-        match tokio::time::timeout(Duration::from_secs(15), handshake_fut).await {
-            Ok(Ok(parts)) => parts,
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "AnyTLS handshake timed out after 15s",
-                ));
-            }
-        };
+    let handshake_fut = perform_handshake(stream, remote_addr, &ctx, &users, &security);
+    let parts = match tokio::time::timeout(Duration::from_secs(15), handshake_fut).await {
+        Ok(Ok(parts)) => parts,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "AnyTLS handshake timed out after 15s",
+            ));
+        }
+    };
+    let Some((stream, user, client_ip, local_ip, conn_guard)) = parts else {
+        // REALITY has handed a probe to the fallback destination. It must not
+        // reach AnyTLS password authentication or consume user limits.
+        return Ok(());
+    };
 
     handle_anytls_session(
         stream,
@@ -227,13 +269,16 @@ async fn perform_handshake(
     mut remote_addr: SocketAddr,
     ctx: &InboundContext,
     users: &Arc<RwLock<Arc<HashMap<[u8; PASSWORD_LEN], Arc<User>>>>>,
-) -> std::io::Result<(
-    BoxedStream,
-    Arc<User>,
-    IpAddr,
-    Option<IpAddr>,
-    crate::limiter::ConnGuard,
-)> {
+    security: &AnyTlsSecurity,
+) -> std::io::Result<
+    Option<(
+        BoxedStream,
+        Arc<User>,
+        IpAddr,
+        Option<IpAddr>,
+        crate::limiter::ConnGuard,
+    )>,
+> {
     let local_ip = stream.local_addr().ok().map(|s| s.ip());
 
     let (src_opt, stream) =
@@ -250,24 +295,34 @@ async fn perform_handshake(
         ));
     }
 
-    let acceptor = ctx.tls_manager.get_acceptor().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "AnyTLS requires TLS configuration; plaintext AnyTLS is forbidden in standard mode",
-        )
-    })?;
-
-    let tls_stream = match acceptor.accept(stream).await {
-        Ok(s) => Box::new(s) as BoxedStream,
-        Err(e) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionAborted,
-                format!("AnyTLS TLS handshake failed: {e}"),
-            ));
+    let mut stream = match security {
+        AnyTlsSecurity::Tls => {
+            let acceptor = ctx.tls_manager.get_acceptor().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "AnyTLS requires TLS configuration; plaintext AnyTLS is forbidden in standard mode",
+                )
+            })?;
+            match acceptor.accept(stream).await {
+                Ok(s) => Box::new(s) as BoxedStream,
+                Err(e) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        format!("AnyTLS TLS handshake failed: {e}"),
+                    ));
+                }
+            }
+        }
+        AnyTlsSecurity::Reality { server, alpn } => {
+            match server
+                .accept(Box::new(stream), remote_addr, alpn.clone())
+                .await?
+            {
+                RealityHandshakeResult::Authenticated(stream) => stream,
+                RealityHandshakeResult::Fallbacked => return Ok(None),
+            }
         }
     };
-
-    let mut stream = tls_stream;
 
     let mut password_hash = [0u8; PASSWORD_LEN];
     stream.read_exact(&mut password_hash).await?;
@@ -321,5 +376,5 @@ async fn perform_handshake(
         }
     }
 
-    Ok((stream, user, client_ip, local_ip, conn_guard))
+    Ok(Some((stream, user, client_ip, local_ip, conn_guard)))
 }

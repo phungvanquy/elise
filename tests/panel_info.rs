@@ -139,6 +139,47 @@ fn mismatched_and_disabled_panel_protocols_are_rejected() {
 }
 
 #[test]
+fn v2node_anytls_reality_is_preserved_without_exposing_keys() {
+    let output = inspect(
+        "v2board",
+        "anytls",
+        json!({"protocol":"anytls","server_port":12345,"tls":2,
+            "tls_settings":{"server_name":"www.example.com","private_key":"private-fixture",
+                "public_key":"public-fixture","short_id":"01"}}),
+        "200 OK",
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let info: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(info["server_type"], "anytls");
+    assert_eq!(info["tls"], 2);
+    assert_eq!(info["reality_keys_present"], true);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("fixture"));
+}
+
+#[test]
+fn separate_anytls_section_can_omit_security() {
+    let output = inspect(
+        "v2board-uniproxy",
+        "anytls",
+        json!({"server_port":12345,"server_name":"node.example.com","padding_scheme":["stop=8"]}),
+        "200 OK",
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let info: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(info["server_type"], "anytls");
+    assert!(info["tls"].is_null());
+    assert_eq!(info["reality_keys_present"], false);
+}
+
+#[test]
 fn hysteria_version_two_selects_hysteria_two_on_each_panel() {
     for panel in ["xboard", "v2board", "xiaov2board", "ppanel", "sspanel"] {
         let output = inspect(panel, "hysteria", node(panel, "hysteria", 2), "200 OK");

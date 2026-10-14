@@ -150,12 +150,14 @@ if reported and (not isinstance(reported, str) or protocol(reported) != protocol
 port = data.get('server_port')
 if not isinstance(port, int) or not (1 <= port <= 65535):
     sys.exit('panel did not return a valid server_port')
-requires_tls = kind in ('anytls', 'hysteria', 'hysteria2')
+requires_tls = kind in ('hysteria', 'hysteria2')
 security = data.get('tls')
 if security is None:
-    security = 1 if requires_tls else 0
+    security = 1 if requires_tls or kind == 'anytls' else 0
 if requires_tls and security != 1:
     sys.exit(f'{kind} requires TLS mode')
+if kind == 'anytls' and security not in (1, 2):
+    sys.exit('anytls requires TLS or REALITY mode')
 if kind == 'vmess' and security not in (0, 1):
     sys.exit('VMess supports plain or TLS mode in this installer')
 if kind == 'vless' and security not in (0, 1, 2):
